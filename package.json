@@ -1,0 +1,13 @@
+{
+  "name": "gim-sney",
+  "version": "1.0.0",
+  "description": "GIM SNEY Bot by ILUNGA MONGA DIEUDONNE",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "latest",
+    "pino": "latest"
+  }
+}
