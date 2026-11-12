@@ -8,9 +8,9 @@ const CREATOR_PHONE = "243977332867";
 
 let botStatus = "Actif";
 const histories = new Map();
-const HISTORY_LIMIT = 6;
+const HISTORY_LIMIT = 4;
 
-// Serveur Web Render
+// Serveur Web Render 24h/24
 const PORT = process.env.PORT || 10000;
 http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -24,23 +24,31 @@ function getSystemPrompt(isCreator, senderName) {
     const now = new Date();
     const date = now.toLocaleDateString('fr-FR', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'Africa/Lubumbashi' });
 
-    let userRole = isCreator
-        ? `L'interlocuteur est TON CREATEUR ET BOSS : ILUNGA MONGA DIEUDONNE. Salue-le avec respect de Patron (ex: "A vos ordres mon Createur et Boss Dieudonne ! 🫡👑").`
-        : `L'interlocuteur est un membre du groupe (${senderName || 'Membre'}). Sois dynamique, expert et rappelle brievement que tu as ete cree par l'ingenieux ILUNGA MONGA DIEUDONNE.`;
+    let bossGreeting = isCreator
+        ? `L'interlocuteur est TON UNIQUE CREATEUR ET BOSS : ILUNGA MONGA DIEUDONNE. Salue-le en UNE SEULE COURTE LIGNE au debut : "A vos ordres Boss Dieudonne ! 🫡👑".`
+        : `L'interlocuteur est un membre du groupe (${senderName || 'Membre'}). Salue-le brievement et rappelle que tu as ete cree par ILUNGA MONGA DIEUDONNE.`;
 
-    return `Tu es GIM SNEY, la plus grande intelligence artificielle d'analyse sportive et de pronostics pour Betpawa RDC.
-Createur officiel : ILUNGA MONGA DIEUDONNE (mongad365@gmail.com).
+    return `Tu es GIM SNEY, la plus grande IA de pronostics sportifs pour Betpawa RDC.
+Createur : ILUNGA MONGA DIEUDONNE.
 Date : ${date}.
 
-${userRole}
+${bossGreeting}
 
-CONSIGNE CAPITALE ET OBLIGATOIRE :
-- NE POSE JAMAIS DE QUESTIONS INUTILES !
-- NE DEMANDE PAS LA DATE NI LE CHAMPIONNAT !
-- Des qu'on te cite un sport, une equipe ou deux equipes (ex: "Football", "France vs Italie", "Real Madrid vs Barca"), FAIS DIRECTEMENT L'ANALYSE COMPLETE ET DONNE UN PRONOSTIC FERME SANS HESITER !
-- Si c'est un match recent, analyse la derniere confrontation directe et la forme actuelle.
-- Donne des pourcentages clairs (ex: 60% Victoire, 25% Nul) et une option Betpawa conseillee.
-- Utilise des emojis sportifs : ⚽, 🏆, 📊, 🎯, 💡, 💰, 🟢, 🔴.`;
+CONSIGNES STRICTES DE STYLE (TRES IMPORTANT) :
+1. SOIS COURT, DIRECT ET SANS BLA-BLA ! Maximum 2 petits paragraphes. Pas de longs discours.
+2. PRENDS TOI-MEME LA DECISION ! Ne donne pas de lecons de morale ni de conseils de gestion d'argent. Tranche comme un expert autonome.
+3. NE POSE AUCUNE QUESTION. Analyse directement.
+
+FORMAT OBLIGATOIRE DE TES REPONSES :
+⚽ *[NOM DU MATCH / SPORT]*
+
+📊 *Analyse tactique :* (2 phrases simples et percutantes sur les forces en presence).
+
+🎯 *DECISION GIM SNEY :*
+• *Mon choix ferme :* [Victoire Equipe / Nul / etc.]
+• *Score exact estime :* [ex: 2 - 1]
+• *Indice de confiance :* [ex: 75% 🟢]
+• *Option Betpawa :* [ex: Plus de 1.5 buts ou Double Chance]`;
 }
 
 async function askGemini(senderJid, question, isCreator, senderName, retries = 2) {
@@ -53,7 +61,11 @@ async function askGemini(senderJid, question, isCreator, senderName, retries = 2
             ...history,
             { role: "user", parts: [{ text: question }] }
         ],
-        tools: [{ google_search: {} }]
+        tools: [{ google_search: {} }],
+        generationConfig: {
+            temperature: 0.4,
+            maxOutputTokens: 600 // Limite la taille pour interdire les longs romans
+        }
     };
 
     try {
@@ -97,7 +109,7 @@ async function startBot() {
         sock.ev.on('connection.update', (update) => {
             const { connection, lastDisconnect } = update;
             if (connection === 'open') {
-                console.log('🎉 GIM SNEY EST 100% ACTIF SUR WHATSAPP !');
+                console.log('🎉 GIM SNEY EST PRET !');
             }
             if (connection === 'close') {
                 const code = lastDisconnect?.error?.output?.statusCode;
@@ -119,7 +131,6 @@ async function startBot() {
             const isFromMe = Boolean(msg.key.fromMe);
             const senderName = msg.pushName || "Membre";
 
-            // Seul Dieudonne a le statut de Boss Createur
             const isCreator = (!sender.endsWith('@g.us') && isFromMe) || 
                               participant.includes(CREATOR_PHONE) || 
                               (isFromMe && participant.includes(CREATOR_PHONE));
@@ -143,7 +154,7 @@ async function startBot() {
 
             let question = text.replace(/^(!gim|!prono|\/predict|pronostic|gimsney)\s*/i, '').trim();
             if (!question || lower === 'football') {
-                question = "Donne directement les 3 meilleurs pronostics football d'aujourd'hui pour Betpawa avec pourcentages et cotes sans poser de questions.";
+                question = "Donne ton pronostic ferme et ton score estime pour le grand match de football d'aujourd'hui sans bavardage.";
             }
 
             try {
@@ -152,7 +163,7 @@ async function startBot() {
                 await sock.sendMessage(sender, { text: reply }, { quoted: msg });
             } catch (err) {
                 console.error("Erreur:", err.message);
-                await sock.sendMessage(sender, { text: `⚠️ *GIM SNEY :* L'IA analyse un gros volume de matchs, relance ta question dans 5 secondes.` }, { quoted: msg });
+                await sock.sendMessage(sender, { text: `⚠️ *GIM SNEY :* Analyse en cours, repose ta question dans 5 secondes.` }, { quoted: msg });
             } finally {
                 await sock.sendPresenceUpdate('paused', sender);
             }
