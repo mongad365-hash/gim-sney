@@ -7,17 +7,19 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AQ.Ab8RN6KeFgt7wruY4XiA-_l
 const CREATOR_PHONE = "243977332867";
 const SELF_URL = "https://gim-sney.onrender.com";
 
-let botStatus = "Actif avec Vision Multimodale";
 const histories = new Map();
 const HISTORY_LIMIT = 4;
 
-// Serveur Web Render & Anti-sommeil
+// Serveur Web Render & Anti-sommeil 24h/24
 const PORT = process.env.PORT || 10000;
 http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('GIM SNEY IA Vision est en ligne 24h/24 !\nCreee par ILUNGA MONGA DIEUDONNE.');
-}).listen(PORT);
+    res.end('GIM SNEY IA est 100% active et en ligne 24h/24 !\nCreee par ILUNGA MONGA DIEUDONNE.');
+}).listen(PORT, () => {
+    console.log(`[HTTP] Serveur actif sur le port ${PORT}`);
+});
 
+// Auto-ping toutes les 10 minutes pour empecher Render de dormir
 setInterval(() => {
     fetch(SELF_URL).catch(() => {});
 }, 10 * 60 * 1000);
@@ -25,14 +27,19 @@ setInterval(() => {
 process.on('uncaughtException', (err) => console.error('[ERREUR]:', err.message));
 process.on('unhandledRejection', (err) => console.error('[PROMESSE]:', err.message));
 
-// Fonction pour télécharger l'image depuis WhatsApp
+// Telechargement securise des images (tickets / captures)
 async function getMediaBuffer(mediaMsg, type = 'image') {
-    const stream = await downloadContentFromMessage(mediaMsg, type);
-    let buffer = Buffer.from([]);
-    for await (const chunk of stream) {
-        buffer = Buffer.concat([buffer, chunk]);
+    try {
+        const stream = await downloadContentFromMessage(mediaMsg, type);
+        let buffer = Buffer.from([]);
+        for await (const chunk of stream) {
+            buffer = Buffer.concat([buffer, chunk]);
+        }
+        return buffer;
+    } catch (e) {
+        console.error("Erreur telechargement image:", e.message);
+        return null;
     }
-    return buffer;
 }
 
 function getSystemPrompt(isCreator, senderName) {
@@ -40,24 +47,22 @@ function getSystemPrompt(isCreator, senderName) {
     const date = now.toLocaleDateString('fr-FR', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'Africa/Lubumbashi' });
 
     let greetingRule = isCreator
-        ? `L'interlocuteur est TON UNIQUE CRÉATEUR ET PATRON : le grand ILUNGA MONGA DIEUDONNÉ en personne. Salue-le avec déférence et respect de Boss (ex: "Salut mon Créateur et Boss Dieudonné ! 🫡👑").`
-        : `L'interlocuteur est un membre du groupe nommé ${senderName || 'l\'ami'}. Parle-lui comme un frère de football ("Salut la famille", "Salut frérot"), chaleureux et complice.`;
+        ? `L'interlocuteur est TON UNIQUE CREATEUR ET PATRON : l'ingenieux ILUNGA MONGA DIEUDONNE en personne. Salue-le avec deferente et respect de Boss (ex: "Salut mon Createur et Boss Dieudonne ! 🫡👑").`
+        : `L'interlocuteur est un membre du groupe (${senderName || 'l\'ami'}). Salue-le comme un frere de foot ("Salut la famille", "Salut frerot").`;
 
-    return `Tu es GIM SNEY, le pronostiqueur star et le cerveau d'élite du groupe WhatsApp "Pronostic du sport".
-Créateur officiel : l'ingénieux ILUNGA MONGA DIEUDONNÉ (mongad365@gmail.com).
-Date : ${date} à Lubumbashi, RDC.
+    return `Tu es GIM SNEY, le pronostiqueur star et le cerveau du groupe WhatsApp "Pronostic du sport".
+Createur officiel : ILUNGA MONGA DIEUDONNE (mongad365@gmail.com).
+Date : ${date} a Lubumbashi, RDC.
 
 ${greetingRule}
 
-SUPER-POUVOIR DE VISION :
-- TU VOIS PARFAITEMENT LES IMAGES ET CAPTURES D'ÉCRAN !
-- Ne dis JAMAIS "je suis une IA textuelle" ou "je ne peux pas voir les images". Tu as des yeux ultra-puissants grâce à Gemini 2.5 Flash !
-- Si on t'envoie une capture d'écran d'un ticket Betpawa, d'un match ou d'une composition d'équipe : lis les équipes, les cotes, repère les pièges et donne ton avis franc et direct en paragraphes clairs.
-
-RÈGLES DE STYLE :
-1. Parle comme un être humain passionné et expert, jamais comme un robot.
-2. Fais des paragraphes courts, bien aérés et percutants avec émojis (⚽, 🎟️, 🏆, 📊, 🎯, 💡, 💰, 🟢, 🔴).
-3. Prends des décisions fermes sur les pronostics et les tickets Betpawa.`;
+REGLES D'OR DE COMPORTEMENT :
+1. PARLE COMME UN HUMAIN PASSIONNE DE FOOT : Pas de "En tant qu'IA..." ou "Selon mes algorithmes...". Sois direct, chaleureux et complice.
+2. FORMAT EN PARAGRAPHES COURTS : Aere bien ton texte avec des sauts de ligne. Utilise des emojis (⚽, 🎟️, 🏆, 📊, 🎯, 💡, 💰, 🟢, 🔴).
+3. ANALYSE DES CAPTURES ET TICKETS BETPAWA :
+   - Tu peux voir et lire les images et captures d'ecran !
+   - Si on te montre un ticket ou des cotes, lis les equipes, repere les matchs risques et donne ton avis franc en quelques paragraphes.
+4. DECISION FERME : Prends toi-meme la decision, donne ton pronostic ferme sans longs avertissements de morale.`;
 }
 
 async function askGemini(senderJid, question, isCreator, senderName, base64Image = null, retries = 2) {
@@ -73,7 +78,7 @@ async function askGemini(senderJid, question, isCreator, senderName, base64Image
             }
         });
     }
-    currentParts.push({ text: question || "Analyse en détail cette capture d'écran de match ou ce ticket Betpawa." });
+    currentParts.push({ text: question || "Analyse en detail cette capture d'ecran ou ce ticket Betpawa." });
 
     const payload = {
         system_instruction: { parts: [{ text: getSystemPrompt(isCreator, senderName) }] },
@@ -99,11 +104,10 @@ async function askGemini(senderJid, question, isCreator, senderName, base64Image
         if (data.error) throw new Error(data.error.message);
 
         const answer = data.candidates?.[0]?.content?.parts?.map(p => p.text || "").join("").trim();
-        if (!answer) throw new Error("Réponse vide de l'IA.");
+        if (!answer) throw new Error("Reponse vide.");
 
-        // Enregistre sans l'image lourde pour ne pas saturer la mémoire
         history.push(
-            { role: "user", parts: [{ text: base64Image ? `[Capture d'écran analysée] : ${question}` : question }] },
+            { role: "user", parts: [{ text: base64Image ? `[Image ticket analysee] : ${question}` : question }] },
             { role: "model", parts: [{ text: answer }] }
         );
         histories.set(senderJid, history.slice(-HISTORY_LIMIT));
@@ -127,10 +131,24 @@ async function startBot() {
             browser: ['Ubuntu', 'Chrome', '20.0.04']
         });
 
+        // Code WhatsApp si besoin
+        if (!sock.authState.creds.registered) {
+            setTimeout(async () => {
+                try {
+                    const code = await sock.requestPairingCode(CREATOR_PHONE);
+                    console.log("\n=================================");
+                    console.log("👉 CODE WHATSAPP : " + code);
+                    console.log("=================================\n");
+                } catch (e) {
+                    console.error("Erreur code:", e.message);
+                }
+            }, 6000);
+        }
+
         sock.ev.on('connection.update', (update) => {
             const { connection, lastDisconnect } = update;
             if (connection === 'open') {
-                console.log('🎉 GIM SNEY AVEC VISION EST EN LIGNE !');
+                console.log('🎉 GIM SNEY EST 100% ACTIF SUR WHATSAPP !');
             }
             if (connection === 'close') {
                 const code = lastDisconnect?.error?.output?.statusCode;
@@ -150,13 +168,13 @@ async function startBot() {
             const sender = msg.key.remoteJid;
             const participant = msg.key.participant || "";
             const isFromMe = Boolean(msg.key.fromMe);
-            const senderName = msg.pushName || "Frérot";
+            const senderName = msg.pushName || "Frerot";
 
             const isCreator = (!sender.endsWith('@g.us') && isFromMe) || 
                               participant.includes(CREATOR_PHONE) || 
                               (isFromMe && participant.includes(CREATOR_PHONE));
 
-            // Détection des images (directe ou citée)
+            // Detection securisee d'image
             const img = msg.message?.imageMessage || 
                         msg.message?.ephemeralMessage?.message?.imageMessage || 
                         msg.message?.viewOnceMessage?.message?.imageMessage || 
@@ -166,19 +184,11 @@ async function startBot() {
 
             let base64Image = null;
             if (img) {
-                try {
-                    const buf = await getMediaBuffer(img, 'image');
-                    base64Image = buf.toString('base64');
-                } catch (e) {
-                    console.error("Erreur téléchargement image:", e.message);
-                }
+                const buf = await getMediaBuffer(img, 'image');
+                if (buf) base64Image = buf.toString('base64');
             } else if (quotedImg) {
-                try {
-                    const buf = await getMediaBuffer(quotedImg, 'image');
-                    base64Image = buf.toString('base64');
-                } catch (e) {
-                    console.error("Erreur téléchargement image citée:", e.message);
-                }
+                const buf = await getMediaBuffer(quotedImg, 'image');
+                if (buf) base64Image = buf.toString('base64');
             }
 
             const caption = img?.caption || "";
@@ -198,23 +208,27 @@ async function startBot() {
                               lower.startsWith('gimsney') || 
                               lower.includes('gimsney') ||
                               lower === 'football' ||
-                              Boolean(base64Image && !sender.endsWith('@g.us')); // En privé, toute image déclenche l'IA
+                              Boolean(base64Image && !sender.endsWith('@g.us')); // En prive avec image, declenche toujours
 
+            // Evite la boucle si le bot s'envoie un message sans commande
+            if (isFromMe && !isTrigger) return;
             if (!isTrigger) return;
 
             let question = text.replace(/^(!gim|!prono|\/predict|pronostic|gimsney)\s*/i, '').trim();
             if (!question && base64Image) {
-                question = "Analyse cette capture d'écran, ce match ou ce ticket Betpawa et donne ton avis d'expert.";
+                question = "Analyse en detail ce ticket Betpawa ou cette capture d'ecran et donne ton avis d'expert.";
+            } else if (!question) {
+                question = "Propose un beau ticket pour aujourd'hui avec cotes et pronostics fermes.";
             }
 
             try {
                 await sock.sendPresenceUpdate('composing', sender);
                 const reply = await askGemini(sender, question, isCreator, senderName, base64Image);
                 await sock.sendMessage(sender, { text: reply }, { quoted: msg });
-                console.log("✅ Analyse (avec Vision) envoyée !");
+                console.log("✅ Reponse envoyee avec succes !");
             } catch (err) {
                 console.error("Erreur:", err.message);
-                await sock.sendMessage(sender, { text: `⚠️ Les gars, j'analyse les cotes en direct, reposez votre question dans 5 secondes !` }, { quoted: msg });
+                await sock.sendMessage(sender, { text: `⚠️ Les gars, j'analyse les cotes en direct sur Betpawa, reposez votre question dans quelques secondes !` }, { quoted: msg });
             } finally {
                 await sock.sendPresenceUpdate('paused', sender);
             }
