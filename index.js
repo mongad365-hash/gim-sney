@@ -4,16 +4,18 @@ const http = require('http');
 const assert = require('assert');
 
 // ==========================================
-// CONFIGURATION OFFICIELLE (INCHANGEE)
+// CONFIGURATION OFFICIELLE
 // ==========================================
+// Note : si tu configures GEMINI_API_KEY dans Render -> Environment, elle sera utilisee automatiquement en priorite.
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AQ.Ab8RN6KeFgt7wruY4XiA-_lb7u5SjVftPUIq6kQTbA3VPv891A";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const CREATOR_PHONE = "243977332867";
 const SELF_URL = "https://gim-sney.onrender.com";
+const DEEP_TWO_PASS = process.env.DEEP_TWO_PASS === "true";
 
 const histories = new Map();
-const HISTORY_LIMIT = 10; // 5 echanges complets (user + model)
-const botSentIds = new Set(); // Anti-boucle infinie
+const HISTORY_LIMIT = 10;
+const botSentIds = new Set();
 
 process.on('uncaughtException', (err) => console.error('[ERREUR]:', err.message));
 process.on('unhandledRejection', (err) => console.error('[PROMESSE]:', err.message));
@@ -27,7 +29,6 @@ function startKeepAliveServer() {
         console.log(`[HTTP] Serveur actif sur le port ${PORT}`);
     });
 
-    // Auto-ping toutes les 10 minutes pour empecher Render de dormir
     setInterval(() => {
         fetch(SELF_URL).catch(() => {});
     }, 10 * 60 * 1000);
@@ -166,7 +167,7 @@ function evaluateDataCoverage(factSheetText = "", searchQueriesCount = 0, source
             maxAllowedConfidence = 7;
             reliabilityLabel = 'MOYENNE';
         } else {
-            maxAllowedConfidence = 9; // Jamais 10/10 : aucun prono n'est certain
+            maxAllowedConfidence = 9;
             reliabilityLabel = 'ELEVEE';
         }
     }
@@ -184,47 +185,30 @@ function evaluateDataCoverage(factSheetText = "", searchQueriesCount = 0, source
     };
 }
 
-async function gatherRealFootballData(question, intent, retries = 1) {
+async function gatherRealFootballData(question, intent) {
     const { date, heure } = getLubumbashiDateTime();
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
 
-    const researchPrompt = `Tu es un moteur de verification de donnees sportives en temps reel.
-Date actuelle : ${date}, heure actuelle : ${heure} a Lubumbashi (UTC+2).
-Demande utilisateur (${intent}) : "${question}"
-
-MISSION STRICTE — COLLECTE FACTUELLE UNIQUEMENT (AUCUN PRONOSTIC) :
-Utilise Google Search pour verifier et rassembler les faits reels du ou des matchs concernes.
-Pour chaque match identifie (max 4 matchs s'il s'agit d'une carte du jour) :
-1. Verifie si le match existe reellement a la date demandee (ou apres ${heure} aujourd'hui). Attention aux treves internationales FIFA.
-2. Si un match demande n'a pas lieu a cette date (deja joue, reporte ou inexistant), indique clairement : [EXISTENCE]: MATCH NON PREVU (avec la vraie date/statut).
-3. Sinon, remplis chaque balise ci-dessous avec des faits reels chiffres. Si une donnee n'est pas trouvee sur le web, ecris exactement DONNEE_INSUFFISANTE :
-
-MATCH : <Equipe A vs Equipe B>
+    const researchPrompt = `Verifie via Google Search les faits reels (${date}, ${heure} a Lubumbashi) pour : "${question}".
+Si un match n'existe pas a cette date, ecris [EXISTENCE]: MATCH NON PREVU.
+Sinon remplis uniquement les faits verifies (ou DONNEE_INSUFFISANTE) :
 [EXISTENCE]: CONFIRME
-[COMPETITION_DATE_HEURE]: <Competition, date exacte, heure a Lubumbashi>
-[FORME_5_MATCHS]: <5 derniers matchs + scores des 2 equipes + bilan domicile/exterieur>
-[CLASSEMENT_STATS]: <Position au classement, buts marques/encaisses, solidite defensive et efficacite offensive>
-[ABSENCES_BLESSURES]: <Joueurs blesses, suspendus ou absents confirmes>
-[H2H]: <Confrontations directes recentes pertinentes avec scores>
-[ENJEU]: <Motivation, objectif classement/qualification>
-
-Ne redige aucune introduction ni conclusion.`;
-
-    const payload = {
-        contents: [{ role: "user", parts: [{ text: researchPrompt }] }],
-        tools: [{ google_search: {} }],
-        generationConfig: {
-            temperature: 0.0,
-            maxOutputTokens: 2048,
-            thinkingConfig: { thinkingBudget: 1024 }
-        }
-    };
+[COMPETITION_DATE_HEURE]: ...
+[FORME_5_MATCHS]: ...
+[CLASSEMENT_STATS]: ...
+[ABSENCES_BLESSURES]: ...
+[H2H]: ...
+[ENJEU]: ...`;
 
     try {
         const res = await fetch(url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
+            body: JSON.stringify({
+                contents: [{ role: "user", parts: [{ text: researchPrompt }] }],
+                tools: [{ google_search: {} }],
+                generationConfig: { temperature: 0.0, maxOutputTokens: 2048 }
+            })
         });
         const data = await res.json();
         if (data.error) throw new Error(data.error.message);
@@ -232,22 +216,11 @@ Ne redige aucune introduction ni conclusion.`;
         const candidate = data.candidates?.[0];
         const queries = candidate?.groundingMetadata?.webSearchQueries || [];
         const sources = candidate?.groundingMetadata?.groundingChunks || [];
-        const factSheet = candidate?.content?.parts
-            ?.filter(p => !p.thought && typeof p.text === 'string')
-            ?.map(p => p.text)
-            ?.join("")
-            ?.trim() || "";
-
+        const factSheet = candidate?.content?.parts?.map(p => p.text || "").join("").trim() || "";
         const coverage = evaluateDataCoverage(factSheet, queries.length, sources.length);
-        console.log(`[MOTEUR FOOT] Intent=${intent} | Requetes=${queries.length} | Sources=${sources.length} | Fiabilite=${coverage.reliabilityLabel} (${coverage.completenessPct}%)`);
-
         return { factSheet, queries, sources, coverage };
     } catch (err) {
-        if (retries > 0) {
-            await new Promise(r => setTimeout(r, 1500));
-            return gatherRealFootballData(question, intent, retries - 1);
-        }
-        console.warn("[MOTEUR FOOT] Fallback recherche directe:", err.message);
+        console.warn("[MOTEUR FOOT] Passage en mode 1 appel:", err.message);
         return null;
     }
 }
@@ -266,27 +239,26 @@ function getSystemPrompt(isCreator, senderName, isFollowUp = false, intent = 'SI
 
     const footballRules = (intent === 'SIMPLE_QUERY')
         ? `FORMAT QUESTION SIMPLE :
-- Reponds en 1 a 3 phrases courtes (ou 3 a 6 phrases si la question demande une explication).
+- Reponds en 1 a 3 phrases courtes (ou 3 a 6 phrases si explication necessaire).
 - Utilise Google Search si la question porte sur un fait recent.`
         : `SYSTEME D'ANALYSE ET DE PRONOSTICS FOOTBALLISTIQUES :
-1. VERIFICATION AVANT ANALYSE :
-   - Si la fiche de donnees indique qu'un match n'existe pas ou n'a pas lieu a cette date, signale-le immediatement avec les vrais faits (ne fais JAMAIS d'analyse sur un match fictif).
-   - N'invente JAMAIS de statistique, score, classement ou blessure absents des donnees verifiees. Si une information manque, signale-le clairement.
-2. ANALYSE FACTUELLE OBLIGATOIRE (par match) :
-   - Synthetise sans blabla : forme des 5 derniers matchs, bilan domicile/exterieur, attaque/defense (buts marques/encaisses), absences/blesses confirmes, H2H et enjeu.
-3. MARCHES A PROPOSER POUR CHAQUE MATCH ANALYSE :
+1. VERIFICATION TEMPS REEL OBLIGATOIRE (GOOGLE SEARCH) :
+   - Avant de pronostiquer, verifie sur Google Search que le match existe reellement a la date (${date}) et apres ${heure} (heure de Lubumbashi), ainsi que la competition, les 5 derniers matchs, le bilan domicile/exterieur, les buts marques/encaisses, les absences/blesses confirmes, les confrontations directes (H2H) et l'enjeu.
+   - Si un match cite n'a pas lieu aujourd'hui (treve internationale, deja joue ou reporte), dis-le immediatement avec les vrais faits et ne l'analyse pas comme un match du soir.
+   - N'invente JAMAIS une statistique ou une blessure. Si une info manque, signale-le clairement.
+2. MARCHES A PROPOSER POUR CHAQUE MATCH ANALYSE :
    - *Victoire 1X2*
    - *Double Chance*
-   - *Plus/Moins de buts* (ex: +1.5 / +2.5 / -3.5)
-   - *BTTS* (Les deux equipes marquent : Oui/Non)
+   - *Plus/Moins de buts*
+   - *BTTS* (Les deux equipes marquent)
    - *Score probable*
    - *Option a risque reduit*
    Justifie chaque choix par les faits reels.
-4. FIABILITE & PROBABILITES :
-   - Distingue explicitement les *probabilites statistiques observees* (ex: frequence sur les 5 derniers matchs ou H2H) des *estimations qualitatives*.
+3. FIABILITE & PROBABILITES :
+   - Distingue explicitement les *probabilites statistiques observees* (sur les matchs/H2H recents) des *estimations qualitatives*.
    - Ne presente JAMAIS un pronostic comme certain.
-   - Respecte strictement le plafond de confiance calcule selon les donnees disponibles (ex: *Confiance : 7/10 — Fiabilité : MOYENNE*).
-5. FORMAT MULTI-MATCHS / TICKET :
+   - Calcule et affiche un niveau de confiance realiste selon les donnees disponibles (ex: *Confiance : 7/10 — Fiabilité : MOYENNE*, jamais 10/10, et max 5/10 si peu d'infos).
+4. FORMAT MULTI-MATCHS / TICKET :
    - Si 4 matchs : presente les 4 analyses directement avec titres courts, chiffres cles et les 6 marches, sans introduction ni repetition.`;
 
     return `Tu es GIM SNEY, analyste sportif d'elite du groupe WhatsApp "Pronostic du sport".
@@ -318,9 +290,8 @@ async function askGemini(senderJid, question, isCreator, senderName, media = nul
     const intent = classifySportsIntent(question, media);
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
 
-    // Passe 1 : Collecte factuelle temps reel pour les demandes d'analyse/pronostic texte
     let researchBundle = null;
-    if (intent === 'MATCH_ANALYSIS' || intent === 'DAILY_ANALYSIS') {
+    if (DEEP_TWO_PASS && (intent === 'MATCH_ANALYSIS' || intent === 'DAILY_ANALYSIS')) {
         researchBundle = await gatherRealFootballData(question, intent);
     }
 
@@ -343,11 +314,7 @@ async function askGemini(senderJid, question, isCreator, senderName, media = nul
     let enrichedPrompt = `[Message de ${isCreator ? 'Boss Dieudonne' : senderName}] : ${promptText}`;
     if (researchBundle?.factSheet) {
         const { coverage, factSheet } = researchBundle;
-        enrichedPrompt += `\n\n[DONNEES VERIFIEES EN TEMPS REEL — NE RIEN INVENTER AU-DELA]\n` +
-            `Fiabilite des donnees : ${coverage.reliabilityLabel} (${coverage.completenessPct}% des criteres verifies, ${coverage.sourcesCount} sources web).\n` +
-            `Plafond maximal de confiance autorise : ${coverage.maxAllowedConfidence}/10.\n` +
-            (coverage.missingFields.length ? `Donnees manquantes a signaler si pertinent : ${coverage.missingFields.join(', ')}.\n` : '') +
-            `\nFICHE FACTUELLE :\n${factSheet}`;
+        enrichedPrompt += `\n\n[DONNEES VERIFIEES]\nFiabilite : ${coverage.reliabilityLabel} (${coverage.completenessPct}%)\nPlafond confiance : ${coverage.maxAllowedConfidence}/10\n${factSheet}`;
     }
 
     currentParts.push({ text: enrichedPrompt });
@@ -361,8 +328,7 @@ async function askGemini(senderJid, question, isCreator, senderName, media = nul
         tools: [{ google_search: {} }],
         generationConfig: {
             temperature: 0.2,
-            maxOutputTokens: 2048,
-            thinkingConfig: { thinkingBudget: 1024 }
+            maxOutputTokens: 4096
         }
     };
 
@@ -374,21 +340,26 @@ async function askGemini(senderJid, question, isCreator, senderName, media = nul
         });
 
         const data = await res.json();
-        if (data.error) throw new Error(data.error.message);
-
-        const candidate = data.candidates?.[0];
-        const queries = candidate?.groundingMetadata?.webSearchQueries;
-        if (queries?.length) {
-            console.log(`[SEARCH] Requetes Google (Passe 2):`, queries);
+        if (!res.ok || data.error) {
+            const errMsg = data.error?.message || `HTTP ${res.status}`;
+            console.error(`[GEMINI HTTP ${res.status}] ${errMsg}`);
+            throw new Error(errMsg);
         }
 
+        const candidate = data.candidates?.[0];
+        const queries = candidate?.groundingMetadata?.webSearchQueries || [];
+        const sources = candidate?.groundingMetadata?.groundingChunks || [];
+        console.log(`[MOTEUR FOOT] Intent=${intent} | Requetes=${queries.length} | Sources=${sources.length}`);
+
         const answer = candidate?.content?.parts
-            ?.filter(p => !p.thought && typeof p.text === 'string')
+            ?.filter(p => typeof p.text === 'string')
             ?.map(p => p.text)
             ?.join("")
             ?.trim();
 
-        if (!answer) throw new Error(`Reponse vide (finishReason: ${candidate?.finishReason || 'inconnu'}).`);
+        if (!answer) {
+            throw new Error(`Reponse vide (finishReason: ${candidate?.finishReason || 'inconnu'}).`);
+        }
 
         const historyUserLabel = media?.kind === 'image'
             ? `[Image/Ticket de ${senderName}] : ${promptText}`
@@ -404,8 +375,10 @@ async function askGemini(senderJid, question, isCreator, senderName, media = nul
 
         return answer;
     } catch (err) {
-        if (retries > 0) {
-            await new Promise(r => setTimeout(r, 2000));
+        const isAuthError = err.message.includes('API key') || err.message.includes('leaked') || err.message.includes('PERMISSION_DENIED');
+        if (!isAuthError && retries > 0) {
+            const delay = err.message.includes('429') || err.message.includes('Quota') ? 4000 : 2000;
+            await new Promise(r => setTimeout(r, delay));
             return askGemini(senderJid, question, isCreator, senderName, media, retries - 1);
         }
         throw err;
@@ -413,7 +386,7 @@ async function askGemini(senderJid, question, isCreator, senderName, media = nul
 }
 
 // ==========================================
-// BOT WHATSAPP BAILEYS (INCHANGE)
+// BOT WHATSAPP BAILEYS
 // ==========================================
 async function startBot() {
     try {
@@ -568,7 +541,6 @@ async function startBot() {
 function runUnitTests() {
     console.log("🧪 Demarrage des tests unitaires du moteur GIM SNEY...\n");
 
-    // Test 1 : Classification des intentions
     assert.strictEqual(classifySportsIntent("Qui a gagne la CAN 2023 ?"), 'SIMPLE_QUERY');
     assert.strictEqual(classifySportsIntent("Analyse Serbie vs Allemagne"), 'MATCH_ANALYSIS');
     assert.strictEqual(classifySportsIntent("Donne moi 4 matchs du jour avec pronostic"), 'DAILY_ANALYSIS');
@@ -576,7 +548,6 @@ function runUnitTests() {
     assert.strictEqual(classifySportsIntent("", { kind: 'audio', mimeType: 'audio/ogg', data: 'abc' }), 'AUDIO_MIXED');
     console.log("✅ Test 1 passe : classifySportsIntent");
 
-    // Test 2 : Couverture complete -> confiance elevee (jamais 10/10)
     const fullSheet = `
 [EXISTENCE]: CONFIRME
 [COMPETITION_DATE_HEURE]: Ligue des Nations, aujourd'hui 20h45
@@ -592,7 +563,6 @@ function runUnitTests() {
     assert.strictEqual(covFull.maxAllowedConfidence, 9);
     console.log("✅ Test 2 passe : evaluateDataCoverage (donnees completes)");
 
-    // Test 3 : Donnees insuffisantes -> plafond abaisse automatiquement
     const weakSheet = `
 [EXISTENCE]: CONFIRME
 [COMPETITION_DATE_HEURE]: Match amical ce soir
@@ -608,14 +578,11 @@ function runUnitTests() {
     assert.strictEqual(covWeak.missingFields.length, 3);
     console.log("✅ Test 3 passe : evaluateDataCoverage (donnees insuffisantes)");
 
-    // Test 4 : Match inexistant -> blocage analyse
-    const missingMatch = `[EXISTENCE]: MATCH NON PREVU AUJOURD'HUI`;
-    const covMissing = evaluateDataCoverage(missingMatch, 1, 2);
+    const covMissing = evaluateDataCoverage(`[EXISTENCE]: MATCH NON PREVU AUJOURD'HUI`, 1, 2);
     assert.strictEqual(covMissing.matchNotFound, true);
     assert.strictEqual(covMissing.maxAllowedConfidence, 0);
     console.log("✅ Test 4 passe : Detection match inexistant");
 
-    // Test 5 : Verification du prompt systeme
     const pFollow = getSystemPrompt(true, "Dieudonne", true, 'MATCH_ANALYSIS');
     assert.ok(pFollow.includes("Ne salue PAS a nouveau"));
     assert.ok(pFollow.includes("Double Chance") && pFollow.includes("BTTS") && pFollow.includes("Score probable"));
@@ -627,7 +594,6 @@ function runUnitTests() {
 async function runLiveTests() {
     console.log("🌐 Demarrage des tests LIVE (Gemini + Google Search)...\n");
     try {
-        // Test Live 1 : Anti-hallucination (match non prevu aujourd'hui)
         const testAntiHallu = await askGemini(
             "test-live-1",
             "Analyse Borussia Dortmund vs Eintracht Francfort ce soir",
@@ -636,7 +602,6 @@ async function runLiveTests() {
         );
         console.log("--- TEST LIVE 1 (Anti-hallucination) ---\n" + testAntiHallu + "\n");
 
-        // Test Live 2 : Analyse reelle d'un match du jour avec 6 marches
         const testRealMatch = await askGemini(
             "test-live-2",
             "Analyse le meilleur match de football de ce soir avec tous tes pronostics",
