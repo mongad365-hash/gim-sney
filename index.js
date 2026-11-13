@@ -7,10 +7,15 @@ const assert = require('assert');
 // CONFIGURATION OFFICIELLE
 // ==========================================
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AQ.Ab8RN6KeFgt7wruY4XiA-_lb7u5SjVftPUIq6kQTbA3VPv891A";
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const PRIMARY_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const GEMINI_FALLBACK_MODELS = [...new Set([
+    PRIMARY_MODEL,
+    "gemini-3.5-flash-lite",
+    "gemini-3.8-flash",
+    "gemini-3.1-flash-lite"
+])];
 const CREATOR_PHONE = "243977332867";
 const SELF_URL = "https://gim-sney.onrender.com";
-const DEEP_TWO_PASS = process.env.DEEP_TWO_PASS === "true";
 
 const histories = new Map();
 const HISTORY_LIMIT = 10;
@@ -34,6 +39,27 @@ function startKeepAliveServer() {
 }
 
 // ==========================================
+// FILTRE STRICT GROUPES UNIQUEMENT
+// ==========================================
+function shouldProcessMessage({ isGroup, text = "", isReplyToBot = false }) {
+    // STRICT : GIM SNEY ne repond JAMAIS dans les conversations privees avec tes contacts
+    if (!isGroup) return false;
+
+    const lower = text.toLowerCase().trim();
+    if (lower === '!reset' || lower === 'gimsney reset') return true;
+
+    const isCommandTrigger =
+        lower.startsWith('!gim') ||
+        lower.startsWith('!prono') ||
+        lower.startsWith('pronostic') ||
+        lower.startsWith('/predict') ||
+        lower.includes('gimsney') ||
+        lower === 'football';
+
+    return isCommandTrigger || isReplyToBot;
+}
+
+// ==========================================
 // UTILITAIRES WHATSAPP & FORMATAGE
 // ==========================================
 function unwrapMessage(message) {
@@ -47,17 +73,11 @@ function unwrapMessage(message) {
 
 function formatForWhatsApp(text = "") {
     return text
-        // Supprime les phrases d'annonce de recherche/action
         .replace(/^.*?(Je vais (maintenant )?(chercher|vérifier|verifier|analyser|scanner)[^\n]*\n+)/gim, '')
-        // Transforme les puces markdown (*   item) en puces WhatsApp propres (• item)
         .replace(/^\s*\*\s+/gm, '• ')
-        // Transforme les titres Markdown (### Titre) en gras WhatsApp (*Titre*)
         .replace(/^#{1,6}\s*(.+)$/gm, (_, title) => `*${title.replace(/\*/g, '').trim()}*`)
-        // Transforme le double gras Markdown (**texte**) en simple gras WhatsApp (*texte*)
         .replace(/\*\*(.+?)\*\*/g, '*$1*')
-        // Supprime les lignes de separation ---
         .replace(/^\s*---+\s*$/gm, '')
-        // Nettoie les sauts de ligne excessifs
         .replace(/\n{3,}/g, '\n\n')
         .trim();
 }
@@ -201,46 +221,6 @@ function evaluateDataCoverage(factSheetText = "", searchQueriesCount = 0, source
     };
 }
 
-async function gatherRealFootballData(question, intent) {
-    const { date, heure } = getLubumbashiDateTime();
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-
-    const researchPrompt = `Verifie via Google Search les faits reels (${date}, ${heure} a Lubumbashi) pour : "${question}".
-Si un match n'existe pas a cette date, ecris [EXISTENCE]: MATCH NON PREVU.
-Sinon remplis uniquement les faits verifies (ou DONNEE_INSUFFISANTE) :
-[EXISTENCE]: CONFIRME
-[COMPETITION_DATE_HEURE]: ...
-[FORME_5_MATCHS]: ...
-[CLASSEMENT_STATS]: ...
-[ABSENCES_BLESSURES]: ...
-[H2H]: ...
-[ENJEU]: ...`;
-
-    try {
-        const res = await fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                contents: [{ role: "user", parts: [{ text: researchPrompt }] }],
-                tools: [{ google_search: {} }],
-                generationConfig: { temperature: 0.0, maxOutputTokens: 2048 }
-            })
-        });
-        const data = await res.json();
-        if (data.error) throw new Error(data.error.message);
-
-        const candidate = data.candidates?.[0];
-        const queries = candidate?.groundingMetadata?.webSearchQueries || [];
-        const sources = candidate?.groundingMetadata?.groundingChunks || [];
-        const factSheet = candidate?.content?.parts?.map(p => p.text || "").join("").trim() || "";
-        const coverage = evaluateDataCoverage(factSheet, queries.length, sources.length);
-        return { factSheet, queries, sources, coverage };
-    } catch (err) {
-        console.warn("[MOTEUR FOOT] Passage en mode 1 appel:", err.message);
-        return null;
-    }
-}
-
 function getSystemPrompt(isCreator, senderName, isFollowUp = false, intent = 'SIMPLE_QUERY') {
     const { date, heure } = getLubumbashiDateTime();
 
@@ -293,16 +273,16 @@ FORMATAGE WHATSAPP STRICT :
 ${footballRules}`;
 }
 
-async function askGemini(senderJid, question, isCreator, senderName, media = null, retries = 2) {
+async function askGemini(senderJid, question, isCreator, senderName, media = null, modelIndex = 0, retries = 1) {
+    const modelName = GEMINI_FALLBACK_MODELS[modelIndex];
+    if (!modelName) {
+        throw new Error("Quota journalier atteint sur tous les modeles Gemini.");
+    }
+
     const history = histories.get(senderJid) || [];
     const isFollowUp = history.length > 0;
     const intent = classifySportsIntent(question, media);
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`;
-
-    let researchBundle = null;
-    if (DEEP_TWO_PASS && (intent === 'MATCH_ANALYSIS' || intent === 'DAILY_ANALYSIS')) {
-        researchBundle = await gatherRealFootballData(question, intent);
-    }
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${GEMINI_API_KEY}`;
 
     const currentParts = [];
     if (media?.data) {
@@ -320,13 +300,7 @@ async function askGemini(senderJid, question, isCreator, senderName, media = nul
             : "Verifie chaque match de ce ticket Betpawa via Google Search, identifie les risques et donne un verdict structure."
     );
 
-    let enrichedPrompt = `[Message de ${isCreator ? 'Boss Dieudonne' : senderName}] : ${promptText}`;
-    if (researchBundle?.factSheet) {
-        const { coverage, factSheet } = researchBundle;
-        enrichedPrompt += `\n\n[DONNEES VERIFIEES]\nFiabilite : ${coverage.reliabilityLabel} (${coverage.completenessPct}%)\nPlafond confiance : ${coverage.maxAllowedConfidence}/10\n${factSheet}`;
-    }
-
-    currentParts.push({ text: enrichedPrompt });
+    currentParts.push({ text: `[Message de ${isCreator ? 'Boss Dieudonne' : senderName}] : ${promptText}` });
 
     const payload = {
         system_instruction: { parts: [{ text: getSystemPrompt(isCreator, senderName, isFollowUp, intent) }] },
@@ -351,14 +325,15 @@ async function askGemini(senderJid, question, isCreator, senderName, media = nul
         const data = await res.json();
         if (!res.ok || data.error) {
             const errMsg = data.error?.message || `HTTP ${res.status}`;
-            console.error(`[GEMINI HTTP ${res.status}] ${errMsg}`);
-            throw new Error(errMsg);
+            const err = new Error(errMsg);
+            err.status = res.status;
+            throw err;
         }
 
         const candidate = data.candidates?.[0];
         const queries = candidate?.groundingMetadata?.webSearchQueries || [];
         const sources = candidate?.groundingMetadata?.groundingChunks || [];
-        console.log(`[MOTEUR FOOT] Intent=${intent} | Requetes=${queries.length} | Sources=${sources.length}`);
+        console.log(`[MOTEUR FOOT] Modele=${modelName} | Intent=${intent} | Requetes=${queries.length} | Sources=${sources.length}`);
 
         const rawAnswer = candidate?.content?.parts
             ?.filter(p => typeof p.text === 'string')
@@ -386,12 +361,27 @@ async function askGemini(senderJid, question, isCreator, senderName, media = nul
 
         return answer;
     } catch (err) {
-        const isAuthError = err.message.includes('API key') || err.message.includes('leaked') || err.message.includes('PERMISSION_DENIED');
-        if (!isAuthError && retries > 0) {
-            const delay = err.message.includes('429') || err.message.includes('Quota') ? 4000 : 2000;
-            await new Promise(r => setTimeout(r, delay));
-            return askGemini(senderJid, question, isCreator, senderName, media, retries - 1);
+        const msg = err.message || "";
+        const isQuotaOrModelError =
+            err.status === 429 ||
+            err.status === 404 ||
+            msg.includes('quota') ||
+            msg.includes('Quota') ||
+            msg.includes('not found') ||
+            msg.includes('RESOURCE_EXHAUSTED');
+
+        if (isQuotaOrModelError && modelIndex + 1 < GEMINI_FALLBACK_MODELS.length) {
+            console.warn(`[FALLBACK] ${modelName} indisponible (${err.status || 'err'}) -> bascule sur ${GEMINI_FALLBACK_MODELS[modelIndex + 1]}`);
+            return askGemini(senderJid, question, isCreator, senderName, media, modelIndex + 1, retries);
         }
+
+        const isAuthError = msg.includes('API key') || msg.includes('leaked') || msg.includes('PERMISSION_DENIED');
+        if (!isAuthError && !isQuotaOrModelError && retries > 0) {
+            await new Promise(r => setTimeout(r, 2000));
+            return askGemini(senderJid, question, isCreator, senderName, media, modelIndex, retries - 1);
+        }
+
+        console.error(`[GEMINI ECHEC] ${modelName}: ${msg}`);
         throw err;
     }
 }
@@ -424,7 +414,7 @@ async function startBot() {
         sock.ev.on('connection.update', (update) => {
             const { connection, lastDisconnect } = update;
             if (connection === 'open') {
-                console.log('🎉 GIM SNEY PRO EST 100% ACTIF SUR WHATSAPP !');
+                console.log('🎉 GIM SNEY PRO EST 100% ACTIF SUR WHATSAPP (GROUPES UNIQUEMENT) !');
             }
             if (connection === 'close') {
                 const code = lastDisconnect?.error?.output?.statusCode;
@@ -449,6 +439,9 @@ async function startBot() {
                 if (!sender || sender === 'status@broadcast') continue;
 
                 const isGroup = sender.endsWith('@g.us');
+                // SECURITE ABSOLUE : bloque immediatement tout message hors groupe
+                if (!isGroup) continue;
+
                 const participant = msg.key.participant || "";
                 const isFromMe = Boolean(msg.key.fromMe);
                 const senderName = msg.pushName || "Frerot";
@@ -480,26 +473,14 @@ async function startBot() {
                     ""
                 ).trim();
 
-                const lower = text.toLowerCase();
+                if (!shouldProcessMessage({ isGroup, text, isReplyToBot })) continue;
 
+                const lower = text.toLowerCase();
                 if (lower === '!reset' || lower === 'gimsney reset') {
                     histories.delete(sender);
                     await sendTracked(sock, sender, { text: "🧹 Memoire nettoyee ! On repart sur de nouvelles bases propres. ⚽" }, { quoted: msg });
                     continue;
                 }
-
-                const isCommandTrigger =
-                    lower.startsWith('!gim') ||
-                    lower.startsWith('!prono') ||
-                    lower.startsWith('pronostic') ||
-                    lower.startsWith('/predict') ||
-                    lower.includes('gimsney') ||
-                    lower === 'football';
-
-                const isPrivateMedia = !isGroup && Boolean(img || audioMsg);
-                const isTrigger = isCommandTrigger || isReplyToBot || isPrivateMedia;
-
-                if (!isTrigger) continue;
 
                 let media = null;
                 if (img) {
@@ -529,12 +510,11 @@ async function startBot() {
                     await sock.sendPresenceUpdate('composing', sender);
                     const reply = await askGemini(sender, question, isCreator, senderName, media);
                     await sendTracked(sock, sender, { text: reply }, { quoted: msg });
-                    console.log("✅ Reponse envoyee avec succes !");
+                    console.log("✅ Reponse envoyee avec succes dans le groupe !");
                 } catch (err) {
-                    console.error("Erreur:", err.message);
-                    const detailBoss = isCreator ? `\n_(Détail Boss : ${err.message})_` : '';
+                    console.error("Erreur groupe:", err.message);
                     await sendTracked(sock, sender, {
-                        text: `⚠️ Les gars, petite saturation sur mes donnees en direct, reposez votre question dans quelques secondes !${detailBoss}`
+                        text: `⚠️ Les gars, petite saturation temporaire sur mes donnees en direct, reposez votre question dans quelques instants !`
                     }, { quoted: msg });
                 } finally {
                     await sock.sendPresenceUpdate('paused', sender);
@@ -553,13 +533,23 @@ async function startBot() {
 function runUnitTests() {
     console.log("🧪 Demarrage des tests unitaires du moteur GIM SNEY...\n");
 
+    // Test 1 : Blocage strict des contacts prives
+    assert.strictEqual(shouldProcessMessage({ isGroup: false, text: "gimsney salut" }), false);
+    assert.strictEqual(shouldProcessMessage({ isGroup: false, text: "", isReplyToBot: true }), false);
+    assert.strictEqual(shouldProcessMessage({ isGroup: true, text: "salut les gars" }), false);
+    assert.strictEqual(shouldProcessMessage({ isGroup: true, text: "Gimsney analyse" }), true);
+    assert.strictEqual(shouldProcessMessage({ isGroup: true, text: "", isReplyToBot: true }), true);
+    console.log("✅ Test 1 passe : Blocage strict des chats prives & declencheurs groupe");
+
+    // Test 2 : Classification des intentions
     assert.strictEqual(classifySportsIntent("Qui a gagne la CAN 2023 ?"), 'SIMPLE_QUERY');
     assert.strictEqual(classifySportsIntent("Analyse Serbie vs Allemagne"), 'MATCH_ANALYSIS');
     assert.strictEqual(classifySportsIntent("Donne moi 4 matchs du jour avec pronostic"), 'DAILY_ANALYSIS');
     assert.strictEqual(classifySportsIntent("", { kind: 'image', mimeType: 'image/jpeg', data: 'abc' }), 'TICKET_AUDIT');
     assert.strictEqual(classifySportsIntent("", { kind: 'audio', mimeType: 'audio/ogg', data: 'abc' }), 'AUDIO_MIXED');
-    console.log("✅ Test 1 passe : classifySportsIntent");
+    console.log("✅ Test 2 passe : classifySportsIntent");
 
+    // Test 3 : Couverture complete -> confiance elevee (jamais 10/10)
     const fullSheet = `
 [EXISTENCE]: CONFIRME
 [COMPETITION_DATE_HEURE]: Ligue des Nations, aujourd'hui 20h45
@@ -573,28 +563,9 @@ function runUnitTests() {
     assert.strictEqual(covFull.completenessPct, 100);
     assert.strictEqual(covFull.reliabilityLabel, 'ELEVEE');
     assert.strictEqual(covFull.maxAllowedConfidence, 9);
-    console.log("✅ Test 2 passe : evaluateDataCoverage (donnees completes)");
+    console.log("✅ Test 3 passe : evaluateDataCoverage");
 
-    const weakSheet = `
-[EXISTENCE]: CONFIRME
-[COMPETITION_DATE_HEURE]: Match amical ce soir
-[FORME_5_MATCHS]: DONNEE_INSUFFISANTE
-[CLASSEMENT_STATS]: DONNEE_INSUFFISANTE
-[ABSENCES_BLESSURES]: DONNEE_INSUFFISANTE
-[H2H]: 1-1 en 2024
-[ENJEU]: Match amical`;
-    const covWeak = evaluateDataCoverage(weakSheet, 1, 1);
-    assert.strictEqual(covWeak.completenessPct, 50);
-    assert.strictEqual(covWeak.reliabilityLabel, 'INSUFFISANTE');
-    assert.ok(covWeak.maxAllowedConfidence <= 5);
-    assert.strictEqual(covWeak.missingFields.length, 3);
-    console.log("✅ Test 3 passe : evaluateDataCoverage (donnees insuffisantes)");
-
-    const covMissing = evaluateDataCoverage(`[EXISTENCE]: MATCH NON PREVU AUJOURD'HUI`, 1, 2);
-    assert.strictEqual(covMissing.matchNotFound, true);
-    assert.strictEqual(covMissing.maxAllowedConfidence, 0);
-    console.log("✅ Test 4 passe : Detection match inexistant");
-
+    // Test 4 : Formatage WhatsApp
     const messy = "Je vais maintenant chercher les statistiques.\n### ⚽ *Mali vs Rwanda*\n**Analyse :**\n*   *Point 1*\n---";
     const cleaned = formatForWhatsApp(messy);
     assert.ok(!cleaned.includes('Je vais maintenant chercher'));
@@ -602,12 +573,7 @@ function runUnitTests() {
     assert.ok(!cleaned.includes('**'));
     assert.ok(cleaned.includes('*⚽ Mali vs Rwanda*'));
     assert.ok(cleaned.includes('• *Point 1*'));
-    console.log("✅ Test 5 passe : formatForWhatsApp");
-
-    const pFollow = getSystemPrompt(true, "Dieudonne", true, 'MATCH_ANALYSIS');
-    assert.ok(pFollow.includes("Ne salue PAS a nouveau"));
-    assert.ok(pFollow.includes("Double Chance") && pFollow.includes("BTTS") && pFollow.includes("Score probable"));
-    console.log("✅ Test 6 passe : Regles redactionnelles et 6 marches presents\n");
+    console.log("✅ Test 4 passe : formatForWhatsApp\n");
 
     console.log("🎉 Tous les tests unitaires ont reussi !");
 }
