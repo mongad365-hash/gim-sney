@@ -6,7 +6,6 @@ const assert = require('assert');
 // ==========================================
 // CONFIGURATION OFFICIELLE
 // ==========================================
-// Note : si tu configures GEMINI_API_KEY dans Render -> Environment, elle sera utilisee automatiquement en priorite.
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AQ.Ab8RN6KeFgt7wruY4XiA-_lb7u5SjVftPUIq6kQTbA3VPv891A";
 const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 const CREATOR_PHONE = "243977332867";
@@ -35,7 +34,7 @@ function startKeepAliveServer() {
 }
 
 // ==========================================
-// UTILITAIRES WHATSAPP & MEDIAS
+// UTILITAIRES WHATSAPP & FORMATAGE
 // ==========================================
 function unwrapMessage(message) {
     if (!message) return null;
@@ -44,6 +43,23 @@ function unwrapMessage(message) {
     if (message.viewOnceMessageV2?.message) return unwrapMessage(message.viewOnceMessageV2.message);
     if (message.viewOnceMessageV2Extension?.message) return unwrapMessage(message.viewOnceMessageV2Extension.message);
     return message;
+}
+
+function formatForWhatsApp(text = "") {
+    return text
+        // Supprime les phrases d'annonce de recherche/action
+        .replace(/^.*?(Je vais (maintenant )?(chercher|vérifier|verifier|analyser|scanner)[^\n]*\n+)/gim, '')
+        // Transforme les puces markdown (*   item) en puces WhatsApp propres (• item)
+        .replace(/^\s*\*\s+/gm, '• ')
+        // Transforme les titres Markdown (### Titre) en gras WhatsApp (*Titre*)
+        .replace(/^#{1,6}\s*(.+)$/gm, (_, title) => `*${title.replace(/\*/g, '').trim()}*`)
+        // Transforme le double gras Markdown (**texte**) en simple gras WhatsApp (*texte*)
+        .replace(/\*\*(.+?)\*\*/g, '*$1*')
+        // Supprime les lignes de separation ---
+        .replace(/^\s*---+\s*$/gm, '')
+        // Nettoie les sauts de ligne excessifs
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
 }
 
 async function getMediaBuffer(mediaMsg, type = 'image') {
@@ -240,26 +256,20 @@ function getSystemPrompt(isCreator, senderName, isFollowUp = false, intent = 'SI
     const footballRules = (intent === 'SIMPLE_QUERY')
         ? `FORMAT QUESTION SIMPLE :
 - Reponds en 1 a 3 phrases courtes (ou 3 a 6 phrases si explication necessaire).
-- Utilise Google Search si la question porte sur un fait recent.`
+- Utilise Google Search si la question porte sur un fait recent (ou pour verifier une URL officielle).`
         : `SYSTEME D'ANALYSE ET DE PRONOSTICS FOOTBALLISTIQUES :
 1. VERIFICATION TEMPS REEL OBLIGATOIRE (GOOGLE SEARCH) :
-   - Avant de pronostiquer, verifie sur Google Search que le match existe reellement a la date (${date}) et apres ${heure} (heure de Lubumbashi), ainsi que la competition, les 5 derniers matchs, le bilan domicile/exterieur, les buts marques/encaisses, les absences/blesses confirmes, les confrontations directes (H2H) et l'enjeu.
-   - Si un match cite n'a pas lieu aujourd'hui (treve internationale, deja joue ou reporte), dis-le immediatement avec les vrais faits et ne l'analyse pas comme un match du soir.
-   - N'invente JAMAIS une statistique ou une blessure. Si une info manque, signale-le clairement.
+   - Fais des recherches Google ciblees sur les matchs du jour (${date}, apres ${heure} a Lubumbashi) ET sur les classements/derniers resultats/absents/H2H reels de chaque equipe citee.
+   - Si un match cite n'a pas lieu aujourd'hui, dis-le immediatement avec les vrais faits.
+   - N'invente JAMAIS une statistique ou une blessure. Si une donnee manque vraiment apres recherche, ecris-le clairement.
 2. MARCHES A PROPOSER POUR CHAQUE MATCH ANALYSE :
-   - *Victoire 1X2*
-   - *Double Chance*
-   - *Plus/Moins de buts*
-   - *BTTS* (Les deux equipes marquent)
-   - *Score probable*
-   - *Option a risque reduit*
-   Justifie chaque choix par les faits reels.
-3. FIABILITE & PROBABILITES :
-   - Distingue explicitement les *probabilites statistiques observees* (sur les matchs/H2H recents) des *estimations qualitatives*.
-   - Ne presente JAMAIS un pronostic comme certain.
-   - Calcule et affiche un niveau de confiance realiste selon les donnees disponibles (ex: *Confiance : 7/10 — Fiabilité : MOYENNE*, jamais 10/10, et max 5/10 si peu d'infos).
+   - *Victoire 1X2* • *Double Chance* • *Plus/Moins de buts* • *BTTS* • *Score probable* • *Option à risque réduit* (avec justification factuelle courte).
+3. COHERENCE STRICTE DE CONFIANCE :
+   - Distingue explicitement les *probabilités statistiques observées* (chiffres reels trouves) des *estimations qualitatives*.
+   - REGLE D'HONNETETE : Si tu n'as PAS trouve les statistiques recentes 2026 (forme/classement/H2H) d'un match, il est STRICTEMENT INTERDIT d'ecrire "Fiabilité : ÉLEVÉE" ou une confiance superieure a 5/10 ! Mets obligatoirement *Confiance : 5/10 — Fiabilité : INSUFFISANTE (données 2026 partielles)*.
+   - Ne presente JAMAIS un pronostic comme certain (jamais 10/10).
 4. FORMAT MULTI-MATCHS / TICKET :
-   - Si 4 matchs : presente les 4 analyses directement avec titres courts, chiffres cles et les 6 marches, sans introduction ni repetition.`;
+   - Si 4 matchs : presente les 4 analyses directement avec titres courts, chiffres reels trouves et les 6 marches, sans introduction ni repetition.`;
 
     return `Tu es GIM SNEY, analyste sportif d'elite du groupe WhatsApp "Pronostic du sport".
 Createur officiel : ILUNGA MONGA DIEUDONNE (mongad365@gmail.com).
@@ -270,16 +280,15 @@ ${greetingRule}
 REGLES REDACTIONNELLES OBLIGATOIRES (STYLE CHATGPT : CONCIS, DIRECT, PRECIS) :
 1. REPONSE DIRECTE : Entre directement dans le sujet, sans longue introduction.
 2. ZERO SALUTATION REPETEE : Ne repete jamais une salutation.
-3. AUCUNE ANNONCE D'ACTION : N'ecris jamais "Je vais verifier...", "Je scanne...", "Je me mets en mode analyse...". Donne directement le resultat.
+3. AUCUNE ANNONCE D'ACTION : N'ecris JAMAIS "Je vais maintenant chercher...", "Je scanne...", "Je verifie...". Donne directement les resultats.
 4. ZERO REMPLISSAGE : Interdiction des formules inutiles ("Excellent Boss", "Accrochez-vous", "Je me lance", "Voici du lourd").
 5. PHRASES COURTES : Style clair, structure, naturel. Jamais de "En tant qu'IA...".
 6. ZERO REPETITION : Ne repete aucune information deja donnee.
 
-STYLE VISUEL WHATSAPP :
-- Titres courts et nets.
-- Paragraphes aeres et listes claires.
+FORMATAGE WHATSAPP STRICT :
+- INTERDIT d'utiliser ###, ##, **double asterisque** ou ---.
+- Utilise UNIQUEMENT le format WhatsApp : *texte en gras* avec UN seul asterisque, et • pour les listes.
 - Emojis moderes (⚽, 🎯, 📊, 🎟️, 🟢, 🟡, 🔴).
-- Mets les elements cles en gras WhatsApp avec un seul asterisque (*Equipe A vs Equipe B*, *1X2*, *Confiance*).
 
 ${footballRules}`;
 }
@@ -351,15 +360,17 @@ async function askGemini(senderJid, question, isCreator, senderName, media = nul
         const sources = candidate?.groundingMetadata?.groundingChunks || [];
         console.log(`[MOTEUR FOOT] Intent=${intent} | Requetes=${queries.length} | Sources=${sources.length}`);
 
-        const answer = candidate?.content?.parts
+        const rawAnswer = candidate?.content?.parts
             ?.filter(p => typeof p.text === 'string')
             ?.map(p => p.text)
             ?.join("")
             ?.trim();
 
-        if (!answer) {
+        if (!rawAnswer) {
             throw new Error(`Reponse vide (finishReason: ${candidate?.finishReason || 'inconnu'}).`);
         }
+
+        const answer = formatForWhatsApp(rawAnswer);
 
         const historyUserLabel = media?.kind === 'image'
             ? `[Image/Ticket de ${senderName}] : ${promptText}`
@@ -521,8 +532,9 @@ async function startBot() {
                     console.log("✅ Reponse envoyee avec succes !");
                 } catch (err) {
                     console.error("Erreur:", err.message);
+                    const detailBoss = isCreator ? `\n_(Détail Boss : ${err.message})_` : '';
                     await sendTracked(sock, sender, {
-                        text: `⚠️ Les gars, petite saturation sur mes donnees en direct, reposez votre question dans quelques secondes !`
+                        text: `⚠️ Les gars, petite saturation sur mes donnees en direct, reposez votre question dans quelques secondes !${detailBoss}`
                     }, { quoted: msg });
                 } finally {
                     await sock.sendPresenceUpdate('paused', sender);
@@ -583,10 +595,19 @@ function runUnitTests() {
     assert.strictEqual(covMissing.maxAllowedConfidence, 0);
     console.log("✅ Test 4 passe : Detection match inexistant");
 
+    const messy = "Je vais maintenant chercher les statistiques.\n### ⚽ *Mali vs Rwanda*\n**Analyse :**\n*   *Point 1*\n---";
+    const cleaned = formatForWhatsApp(messy);
+    assert.ok(!cleaned.includes('Je vais maintenant chercher'));
+    assert.ok(!cleaned.includes('###'));
+    assert.ok(!cleaned.includes('**'));
+    assert.ok(cleaned.includes('*⚽ Mali vs Rwanda*'));
+    assert.ok(cleaned.includes('• *Point 1*'));
+    console.log("✅ Test 5 passe : formatForWhatsApp");
+
     const pFollow = getSystemPrompt(true, "Dieudonne", true, 'MATCH_ANALYSIS');
     assert.ok(pFollow.includes("Ne salue PAS a nouveau"));
     assert.ok(pFollow.includes("Double Chance") && pFollow.includes("BTTS") && pFollow.includes("Score probable"));
-    console.log("✅ Test 5 passe : Regles redactionnelles et 6 marches presents\n");
+    console.log("✅ Test 6 passe : Regles redactionnelles et 6 marches presents\n");
 
     console.log("🎉 Tous les tests unitaires ont reussi !");
 }
