@@ -1,6 +1,9 @@
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadContentFromMessage } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 const assert = require('assert');
 
 // ==========================================
@@ -16,9 +19,8 @@ const GEMINI_FALLBACK_MODELS = [...new Set([
 ])];
 const CREATOR_PHONE = "243977332867";
 const SELF_URL = "https://gim-sney.onrender.com";
+const MEMORY_DB_DIR = process.env.MEMORY_DIR || path.join(__dirname, 'gim_memory_db');
 
-const histories = new Map();
-const HISTORY_LIMIT = 10;
 const botSentIds = new Set();
 
 process.on('uncaughtException', (err) => console.error('[ERREUR]:', err.message));
@@ -39,10 +41,229 @@ function startKeepAliveServer() {
 }
 
 // ==========================================
+// BASE DE DONNEES PERSISTANTE PAR UTILISATEUR
+// ==========================================
+function formatTimeAgo(isoDate) {
+    if (!isoDate) return "premier echange";
+    const diffMs = Date.now() - new Date(isoDate).getTime();
+    if (Number.isNaN(diffMs) || diffMs < 0) return "a l'instant";
+
+    const minutes = Math.floor(diffMs / 60000);
+    if (minutes < 2) return "a l'instant";
+    if (minutes < 60) return `il y a ${minutes} minutes`;
+
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `il y a ${hours} heure${hours > 1 ? 's' : ''}`;
+
+    const days = Math.floor(hours / 24);
+    return `il y a ${days} jour${days > 1 ? 's' : ''}`;
+}
+
+class PersistentMemoryDB {
+    constructor(dbDir = MEMORY_DB_DIR, activeWindowMessages = 12, maxLongTermFacts = 15) {
+        this.dbDir = dbDir;
+        this.activeWindowMessages = activeWindowMessages; // 6 echanges complets (user + model)
+        this.maxLongTermFacts = maxLongTermFacts;
+        this.cache = new Map();
+        this.ensureDir();
+    }
+
+    ensureDir() {
+        if (!fs.existsSync(this.dbDir)) {
+            fs.mkdirSync(this.dbDir, { recursive: true });
+        }
+    }
+
+    getFilePath(userId) {
+        const safeId = String(userId || 'unknown').replace(/[^a-zA-Z0-9_-]/g, '_');
+        return path.join(this.dbDir, `user_${safeId}.json`);
+    }
+
+    loadUser(userId, defaultName = "Membre") {
+        if (this.cache.has(userId)) {
+            return this.cache.get(userId);
+        }
+
+        this.ensureDir();
+        const filePath = this.getFilePath(userId);
+        let record = null;
+
+        if (fs.existsSync(filePath)) {
+            try {
+                const raw = fs.readFileSync(filePath, 'utf8');
+                record = JSON.parse(raw);
+            } catch (err) {
+                console.error(`[MEMOIRE] Lecture impossible pour ${userId}:`, err.message);
+            }
+        }
+
+        if (!record || typeof record !== 'object') {
+            record = {
+                userId,
+                phone: /^\d+$/.test(userId) ? userId : null,
+                name: defaultName,
+                createdAt: new Date().toISOString(),
+                lastSeenAt: null,
+                longTermFacts: [],
+                recentMessages: []
+            };
+        }
+
+        if (!Array.isArray(record.longTermFacts)) record.longTermFacts = [];
+        if (!Array.isArray(record.recentMessages)) record.recentMessages = [];
+
+        this.cache.set(userId, record);
+        return record;
+    }
+
+    saveUser(record) {
+        this.ensureDir();
+        const filePath = this.getFilePath(record.userId);
+        const tmpPath = `${filePath}.tmp`;
+        fs.writeFileSync(tmpPath, JSON.stringify(record, null, 2), 'utf8');
+        fs.renameSync(tmpPath, filePath);
+        this.cache.set(record.userId, record);
+    }
+
+    // Retourne un historique strictement alterne (user -> model) pour Gemini
+    getGeminiHistory(userId, defaultName = "Membre") {
+        const record = this.loadUser(userId, defaultName);
+        const rawMsgs = record.recentMessages;
+        const validPairs = [];
+
+        for (let i = 0; i + 1 < rawMsgs.length; i++) {
+            const u = rawMsgs[i];
+            const m = rawMsgs[i + 1];
+            if (u?.role === 'user' && m?.role === 'model' && u.text && m.text) {
+                validPairs.push(
+                    { role: 'user', parts: [{ text: u.text }] },
+                    { role: 'model', parts: [{ text: m.text }] }
+                );
+                i++; // avance d'une paire complete
+            }
+        }
+
+        return {
+            record,
+            geminiHistory: validPairs.slice(-this.activeWindowMessages),
+            timeSinceLastSeen: formatTimeAgo(record.lastSeenAt)
+        };
+    }
+
+    appendExchange(userIdentity, userText, botReply, meta = {}) {
+        const record = this.loadUser(userIdentity.userId, userIdentity.displayName);
+        const nowIso = new Date().toISOString();
+
+        if (userIdentity.displayName) record.name = userIdentity.displayName;
+        if (userIdentity.phone) record.phone = userIdentity.phone;
+        record.lastSeenAt = nowIso;
+
+        record.recentMessages.push(
+            {
+                role: 'user',
+                text: userText,
+                timestamp: nowIso,
+                groupJid: meta.groupJid || null,
+                intent: meta.intent || null
+            },
+            {
+                role: 'model',
+                text: botReply,
+                timestamp: nowIso,
+                groupJid: meta.groupJid || null
+            }
+        );
+
+        // Compacte les echanges plus anciens dans la memoire long terme
+        while (record.recentMessages.length > this.activeWindowMessages) {
+            const oldUser = record.recentMessages.shift();
+            const oldModel = (record.recentMessages[0]?.role === 'model') ? record.recentMessages.shift() : null;
+            if (oldUser?.text) {
+                const dateTag = (oldUser.timestamp || nowIso).slice(0, 10);
+                const cleanQ = oldUser.text.replace(/\s+/g, ' ').slice(0, 110);
+                const cleanA = (oldModel?.text || '').replace(/\s+/g, ' ').slice(0, 110);
+                const summary = `[${dateTag}] Demande: "${cleanQ}" -> Reponse: "${cleanA}"`;
+                record.longTermFacts.push(summary);
+            }
+        }
+
+        if (record.longTermFacts.length > this.maxLongTermFacts) {
+            record.longTermFacts = record.longTermFacts.slice(-this.maxLongTermFacts);
+        }
+
+        this.saveUser(record);
+    }
+
+    clearUserMemory(userId) {
+        const filePath = this.getFilePath(userId);
+        this.cache.delete(userId);
+        if (fs.existsSync(filePath)) {
+            fs.unlinkSync(filePath);
+        }
+    }
+}
+
+const memoryDB = new PersistentMemoryDB(MEMORY_DB_DIR);
+
+// ==========================================
+// IDENTIFICATION UTILISATEUR WHATSAPP
+// ==========================================
+function extractPhoneFromJid(jid = "") {
+    if (!jid || typeof jid !== 'string') return "";
+    if (jid.endsWith('@g.us') || jid.endsWith('@lid')) return "";
+    const userPart = jid.split('@')[0] || "";
+    return userPart.split(':')[0].replace(/\D/g, '');
+}
+
+async function resolveUserIdentity(msg, sock = null, creatorPhone = CREATOR_PHONE) {
+    const remoteJid = msg?.key?.remoteJid || "";
+    const participant = msg?.key?.participant || "";
+    const participantAlt = msg?.key?.participantAlt || "";
+    const isFromMe = Boolean(msg?.key?.fromMe);
+
+    let phone = extractPhoneFromJid(participantAlt) || extractPhoneFromJid(participant);
+
+    if (!phone && participant.endsWith('@lid') && sock?.signalRepository?.lidMapping?.getPNForLID) {
+        try {
+            const pnJid = await sock.signalRepository.lidMapping.getPNForLID(participant);
+            phone = extractPhoneFromJid(pnJid);
+        } catch (_) {}
+    }
+
+    if (!phone && !remoteJid.endsWith('@g.us')) {
+        phone = extractPhoneFromJid(remoteJid);
+    }
+
+    if (!phone && isFromMe) {
+        phone = creatorPhone;
+    }
+
+    const isCreator = isFromMe ||
+        phone === creatorPhone ||
+        participant.includes(creatorPhone) ||
+        participantAlt.includes(creatorPhone);
+
+    if (isCreator && !phone) {
+        phone = creatorPhone;
+    }
+
+    const rawLid = participant.endsWith('@lid')
+        ? participant.split('@')[0].split(':')[0].replace(/\W/g, '')
+        : '';
+    const userId = phone || (rawLid ? `lid_${rawLid}` : 'unknown');
+
+    return {
+        userId,
+        phone: phone || null,
+        isCreator,
+        displayName: msg?.pushName || (isCreator ? "Boss Dieudonne" : "Frerot")
+    };
+}
+
+// ==========================================
 // FILTRE STRICT GROUPES UNIQUEMENT
 // ==========================================
 function shouldProcessMessage({ isGroup, text = "", isReplyToBot = false }) {
-    // STRICT : GIM SNEY ne repond JAMAIS dans les conversations privees avec tes contacts
     if (!isGroup) return false;
 
     const lower = text.toLowerCase().trim();
@@ -221,17 +442,27 @@ function evaluateDataCoverage(factSheetText = "", searchQueriesCount = 0, source
     };
 }
 
-function getSystemPrompt(isCreator, senderName, isFollowUp = false, intent = 'SIMPLE_QUERY') {
+function getSystemPrompt(userIdentity, memoryContext, intent = 'SIMPLE_QUERY') {
     const { date, heure } = getLubumbashiDateTime();
+    const { isCreator, displayName, userId } = userIdentity;
+    const { record, geminiHistory, timeSinceLastSeen } = memoryContext;
+
+    const isRecentFollowUp = geminiHistory.length > 0 && (timeSinceLastSeen === "a l'instant" || timeSinceLastSeen.includes('minutes'));
 
     let greetingRule;
-    if (isFollowUp) {
-        greetingRule = `SUITE DE CONVERSATION : Ne salue PAS a nouveau. Reponds directement sans aucune formule d'accueil.`;
+    if (isRecentFollowUp) {
+        greetingRule = `SUITE IMMEDIATE DE CONVERSATION : Ne salue PAS a nouveau. Reponds directement sans aucune formule d'accueil.`;
     } else if (isCreator) {
         greetingRule = `INTERLOCUTEUR : Ton Createur ILUNGA MONGA DIEUDONNE. Salue en une phrase ultra-courte maximum (ex: "Bonjour Créateur ! 🫡 Voici...") puis donne immediatement la reponse.`;
     } else {
-        greetingRule = `INTERLOCUTEUR : ${senderName || 'Membre du groupe'}. Salue en quelques mots maximum (ex: "Salut ${senderName || 'frérot'} ! Voici...") puis donne immediatement la reponse.`;
+        greetingRule = `INTERLOCUTEUR : ${displayName}. Salue en quelques mots maximum (ex: "Salut ${displayName} ! Voici...") puis donne immediatement la reponse.`;
     }
+
+    const longTermBlock = record.longTermFacts.length > 0
+        ? `\nMEMOIRE PERSISTANTE DE CET UTILISATEUR (${userId}, dernier passage : ${timeSinceLastSeen}) :\n- ` +
+          record.longTermFacts.join('\n- ') +
+          `\nUtilise ce contexte uniquement s'il est pertinent pour la question actuelle, sans le reciter inutilement.`
+        : (record.lastSeenAt ? `\nMEMOIRE UTILISATEUR (${userId}) : Dernier echange ${timeSinceLastSeen}.` : '');
 
     const footballRules = (intent === 'SIMPLE_QUERY')
         ? `FORMAT QUESTION SIMPLE :
@@ -256,6 +487,7 @@ Createur officiel : ILUNGA MONGA DIEUDONNE (mongad365@gmail.com).
 Date et heure actuelles : ${date}, ${heure} a Lubumbashi (RDC).
 
 ${greetingRule}
+${longTermBlock}
 
 REGLES REDACTIONNELLES OBLIGATOIRES (STYLE CHATGPT : CONCIS, DIRECT, PRECIS) :
 1. REPONSE DIRECTE : Entre directement dans le sujet, sans longue introduction.
@@ -273,344 +505,10 @@ FORMATAGE WHATSAPP STRICT :
 ${footballRules}`;
 }
 
-async function askGemini(senderJid, question, isCreator, senderName, media = null, modelIndex = 0, retries = 1) {
+async function askGemini(groupJid, userIdentity, question, media = null, db = memoryDB, modelIndex = 0, retries = 1) {
     const modelName = GEMINI_FALLBACK_MODELS[modelIndex];
     if (!modelName) {
         throw new Error("Quota journalier atteint sur tous les modeles Gemini.");
     }
 
-    const history = histories.get(senderJid) || [];
-    const isFollowUp = history.length > 0;
-    const intent = classifySportsIntent(question, media);
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${GEMINI_API_KEY}`;
-
-    const currentParts = [];
-    if (media?.data) {
-        currentParts.push({
-            inline_data: {
-                mime_type: media.mimeType,
-                data: media.data
-            }
-        });
-    }
-
-    const promptText = question || (
-        media?.kind === 'audio'
-            ? "Ecoute attentivement ce message vocal et reponds directement a la demande."
-            : "Verifie chaque match de ce ticket Betpawa via Google Search, identifie les risques et donne un verdict structure."
-    );
-
-    currentParts.push({ text: `[Message de ${isCreator ? 'Boss Dieudonne' : senderName}] : ${promptText}` });
-
-    const payload = {
-        system_instruction: { parts: [{ text: getSystemPrompt(isCreator, senderName, isFollowUp, intent) }] },
-        contents: [
-            ...history,
-            { role: "user", parts: currentParts }
-        ],
-        tools: [{ google_search: {} }],
-        generationConfig: {
-            temperature: 0.2,
-            maxOutputTokens: 4096
-        }
-    };
-
-    try {
-        const res = await fetch(url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
-
-        const data = await res.json();
-        if (!res.ok || data.error) {
-            const errMsg = data.error?.message || `HTTP ${res.status}`;
-            const err = new Error(errMsg);
-            err.status = res.status;
-            throw err;
-        }
-
-        const candidate = data.candidates?.[0];
-        const queries = candidate?.groundingMetadata?.webSearchQueries || [];
-        const sources = candidate?.groundingMetadata?.groundingChunks || [];
-        console.log(`[MOTEUR FOOT] Modele=${modelName} | Intent=${intent} | Requetes=${queries.length} | Sources=${sources.length}`);
-
-        const rawAnswer = candidate?.content?.parts
-            ?.filter(p => typeof p.text === 'string')
-            ?.map(p => p.text)
-            ?.join("")
-            ?.trim();
-
-        if (!rawAnswer) {
-            throw new Error(`Reponse vide (finishReason: ${candidate?.finishReason || 'inconnu'}).`);
-        }
-
-        const answer = formatForWhatsApp(rawAnswer);
-
-        const historyUserLabel = media?.kind === 'image'
-            ? `[Image/Ticket de ${senderName}] : ${promptText}`
-            : media?.kind === 'audio'
-            ? `[Note vocale de ${senderName}]`
-            : `[Message de ${isCreator ? 'Boss Dieudonne' : senderName}] : ${promptText}`;
-
-        history.push(
-            { role: "user", parts: [{ text: historyUserLabel }] },
-            { role: "model", parts: [{ text: answer }] }
-        );
-        histories.set(senderJid, history.slice(-HISTORY_LIMIT));
-
-        return answer;
-    } catch (err) {
-        const msg = err.message || "";
-        const isQuotaOrModelError =
-            err.status === 429 ||
-            err.status === 404 ||
-            msg.includes('quota') ||
-            msg.includes('Quota') ||
-            msg.includes('not found') ||
-            msg.includes('RESOURCE_EXHAUSTED');
-
-        if (isQuotaOrModelError && modelIndex + 1 < GEMINI_FALLBACK_MODELS.length) {
-            console.warn(`[FALLBACK] ${modelName} indisponible (${err.status || 'err'}) -> bascule sur ${GEMINI_FALLBACK_MODELS[modelIndex + 1]}`);
-            return askGemini(senderJid, question, isCreator, senderName, media, modelIndex + 1, retries);
-        }
-
-        const isAuthError = msg.includes('API key') || msg.includes('leaked') || msg.includes('PERMISSION_DENIED');
-        if (!isAuthError && !isQuotaOrModelError && retries > 0) {
-            await new Promise(r => setTimeout(r, 2000));
-            return askGemini(senderJid, question, isCreator, senderName, media, modelIndex, retries - 1);
-        }
-
-        console.error(`[GEMINI ECHEC] ${modelName}: ${msg}`);
-        throw err;
-    }
-}
-
-// ==========================================
-// BOT WHATSAPP BAILEYS
-// ==========================================
-async function startBot() {
-    try {
-        const { state, saveCreds } = await useMultiFileAuthState('session_auth');
-        const sock = makeWASocket({
-            logger: pino({ level: 'silent' }),
-            auth: state,
-            browser: ['Ubuntu', 'Chrome', '20.0.04']
-        });
-
-        if (!sock.authState.creds.registered) {
-            setTimeout(async () => {
-                try {
-                    const code = await sock.requestPairingCode(CREATOR_PHONE);
-                    console.log("\n=================================");
-                    console.log("👉 CODE WHATSAPP : " + code);
-                    console.log("=================================\n");
-                } catch (e) {
-                    console.error("Erreur code:", e.message);
-                }
-            }, 6000);
-        }
-
-        sock.ev.on('connection.update', (update) => {
-            const { connection, lastDisconnect } = update;
-            if (connection === 'open') {
-                console.log('🎉 GIM SNEY PRO EST 100% ACTIF SUR WHATSAPP (GROUPES UNIQUEMENT) !');
-            }
-            if (connection === 'close') {
-                const code = lastDisconnect?.error?.output?.statusCode;
-                if (code !== DisconnectReason.loggedOut) {
-                    setTimeout(() => startBot(), 3000);
-                }
-            }
-        });
-
-        sock.ev.on('creds.update', saveCreds);
-
-        sock.ev.on('messages.upsert', async ({ messages, type }) => {
-            if (type !== 'notify') return;
-
-            for (const msg of messages) {
-                if (!msg?.message) continue;
-
-                const msgId = msg.key?.id;
-                if (msgId && botSentIds.has(msgId)) continue;
-
-                const sender = msg.key.remoteJid;
-                if (!sender || sender === 'status@broadcast') continue;
-
-                const isGroup = sender.endsWith('@g.us');
-                // SECURITE ABSOLUE : bloque immediatement tout message hors groupe
-                if (!isGroup) continue;
-
-                const participant = msg.key.participant || "";
-                const isFromMe = Boolean(msg.key.fromMe);
-                const senderName = msg.pushName || "Frerot";
-
-                const isCreator = isFromMe ||
-                    participant.includes(CREATOR_PHONE) ||
-                    sender.includes(CREATOR_PHONE);
-
-                const content = unwrapMessage(msg.message);
-                if (!content) continue;
-
-                const contextInfo =
-                    content.extendedTextMessage?.contextInfo ||
-                    content.imageMessage?.contextInfo ||
-                    content.audioMessage?.contextInfo;
-
-                const quotedContent = unwrapMessage(contextInfo?.quotedMessage);
-                const quotedId = contextInfo?.stanzaId;
-                const isReplyToBot = Boolean(quotedId && botSentIds.has(quotedId));
-
-                const img = content.imageMessage || quotedContent?.imageMessage;
-                const audioMsg = content.audioMessage || quotedContent?.audioMessage;
-
-                const caption = content.imageMessage?.caption || "";
-                const text = (
-                    content.conversation ||
-                    content.extendedTextMessage?.text ||
-                    caption ||
-                    ""
-                ).trim();
-
-                if (!shouldProcessMessage({ isGroup, text, isReplyToBot })) continue;
-
-                const lower = text.toLowerCase();
-                if (lower === '!reset' || lower === 'gimsney reset') {
-                    histories.delete(sender);
-                    await sendTracked(sock, sender, { text: "🧹 Memoire nettoyee ! On repart sur de nouvelles bases propres. ⚽" }, { quoted: msg });
-                    continue;
-                }
-
-                let media = null;
-                if (img) {
-                    const buf = await getMediaBuffer(img, 'image');
-                    if (buf) {
-                        const cleanMime = (img.mimetype || 'image/jpeg').split(';')[0].trim();
-                        media = { kind: 'image', mimeType: cleanMime, data: buf.toString('base64') };
-                    }
-                } else if (audioMsg) {
-                    const buf = await getMediaBuffer(audioMsg, 'audio');
-                    if (buf) {
-                        const cleanMime = (audioMsg.mimetype || 'audio/ogg').split(';')[0].trim();
-                        media = { kind: 'audio', mimeType: cleanMime, data: buf.toString('base64') };
-                    }
-                }
-
-                let question = text.replace(/^(!gim|!prono|\/predict|pronostic|gimsney)\s*/i, '').trim();
-                if (!question && media?.kind === 'image') {
-                    question = "Analyse en detail ce ticket Betpawa ou cette capture d'ecran et donne ton avis d'expert.";
-                } else if (!question && media?.kind === 'audio') {
-                    question = "";
-                } else if (!question) {
-                    question = "Cherche les vrais matchs d'aujourd'hui et propose une analyse complete avec pronostics.";
-                }
-
-                try {
-                    await sock.sendPresenceUpdate('composing', sender);
-                    const reply = await askGemini(sender, question, isCreator, senderName, media);
-                    await sendTracked(sock, sender, { text: reply }, { quoted: msg });
-                    console.log("✅ Reponse envoyee avec succes dans le groupe !");
-                } catch (err) {
-                    console.error("Erreur groupe:", err.message);
-                    await sendTracked(sock, sender, {
-                        text: `⚠️ Les gars, petite saturation temporaire sur mes donnees en direct, reposez votre question dans quelques instants !`
-                    }, { quoted: msg });
-                } finally {
-                    await sock.sendPresenceUpdate('paused', sender);
-                }
-            }
-        });
-    } catch (e) {
-        console.error("Erreur demarrage:", e.message);
-        setTimeout(() => startBot(), 5000);
-    }
-}
-
-// ==========================================
-// TESTS DU MOTEUR SPORTIF (--test / --test-live)
-// ==========================================
-function runUnitTests() {
-    console.log("🧪 Demarrage des tests unitaires du moteur GIM SNEY...\n");
-
-    // Test 1 : Blocage strict des contacts prives
-    assert.strictEqual(shouldProcessMessage({ isGroup: false, text: "gimsney salut" }), false);
-    assert.strictEqual(shouldProcessMessage({ isGroup: false, text: "", isReplyToBot: true }), false);
-    assert.strictEqual(shouldProcessMessage({ isGroup: true, text: "salut les gars" }), false);
-    assert.strictEqual(shouldProcessMessage({ isGroup: true, text: "Gimsney analyse" }), true);
-    assert.strictEqual(shouldProcessMessage({ isGroup: true, text: "", isReplyToBot: true }), true);
-    console.log("✅ Test 1 passe : Blocage strict des chats prives & declencheurs groupe");
-
-    // Test 2 : Classification des intentions
-    assert.strictEqual(classifySportsIntent("Qui a gagne la CAN 2023 ?"), 'SIMPLE_QUERY');
-    assert.strictEqual(classifySportsIntent("Analyse Serbie vs Allemagne"), 'MATCH_ANALYSIS');
-    assert.strictEqual(classifySportsIntent("Donne moi 4 matchs du jour avec pronostic"), 'DAILY_ANALYSIS');
-    assert.strictEqual(classifySportsIntent("", { kind: 'image', mimeType: 'image/jpeg', data: 'abc' }), 'TICKET_AUDIT');
-    assert.strictEqual(classifySportsIntent("", { kind: 'audio', mimeType: 'audio/ogg', data: 'abc' }), 'AUDIO_MIXED');
-    console.log("✅ Test 2 passe : classifySportsIntent");
-
-    // Test 3 : Couverture complete -> confiance elevee (jamais 10/10)
-    const fullSheet = `
-[EXISTENCE]: CONFIRME
-[COMPETITION_DATE_HEURE]: Ligue des Nations, aujourd'hui 20h45
-[FORME_5_MATCHS]: 3V 1N 1D vs 4V 1N 0D
-[CLASSEMENT_STATS]: 2e (11 buts marques, 4 encaisses) vs 1er (14 buts, 3 encaisses)
-[ABSENCES_BLESSURES]: Aucun absent majeur
-[H2H]: 2 victoires, 1 nul sur les 3 derniers duels
-[ENJEU]: Qualification pour les quarts`;
-    const covFull = evaluateDataCoverage(fullSheet, 2, 4);
-    assert.strictEqual(covFull.matchNotFound, false);
-    assert.strictEqual(covFull.completenessPct, 100);
-    assert.strictEqual(covFull.reliabilityLabel, 'ELEVEE');
-    assert.strictEqual(covFull.maxAllowedConfidence, 9);
-    console.log("✅ Test 3 passe : evaluateDataCoverage");
-
-    // Test 4 : Formatage WhatsApp
-    const messy = "Je vais maintenant chercher les statistiques.\n### ⚽ *Mali vs Rwanda*\n**Analyse :**\n*   *Point 1*\n---";
-    const cleaned = formatForWhatsApp(messy);
-    assert.ok(!cleaned.includes('Je vais maintenant chercher'));
-    assert.ok(!cleaned.includes('###'));
-    assert.ok(!cleaned.includes('**'));
-    assert.ok(cleaned.includes('*⚽ Mali vs Rwanda*'));
-    assert.ok(cleaned.includes('• *Point 1*'));
-    console.log("✅ Test 4 passe : formatForWhatsApp\n");
-
-    console.log("🎉 Tous les tests unitaires ont reussi !");
-}
-
-async function runLiveTests() {
-    console.log("🌐 Demarrage des tests LIVE (Gemini + Google Search)...\n");
-    try {
-        const testAntiHallu = await askGemini(
-            "test-live-1",
-            "Analyse Borussia Dortmund vs Eintracht Francfort ce soir",
-            true,
-            "Dieudonne"
-        );
-        console.log("--- TEST LIVE 1 (Anti-hallucination) ---\n" + testAntiHallu + "\n");
-
-        const testRealMatch = await askGemini(
-            "test-live-2",
-            "Analyse le meilleur match de football de ce soir avec tous tes pronostics",
-            true,
-            "Dieudonne"
-        );
-        console.log("--- TEST LIVE 2 (Analyse reelle du jour) ---\n" + testRealMatch + "\n");
-        console.log("✅ Tests LIVE termines !");
-    } catch (err) {
-        console.error("❌ Echec test LIVE:", err.message);
-        process.exit(1);
-    }
-}
-
-// ==========================================
-// POINT D'ENTREE
-// ==========================================
-if (process.argv.includes('--test')) {
-    runUnitTests();
-} else if (process.argv.includes('--test-live')) {
-    runLiveTests();
-} else {
-    startKeepAliveServer();
-    startBot();
-}
+    const memoryContext = db.getGeminiHistory(userIdent
