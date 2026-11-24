@@ -165,6 +165,7 @@ function unwrapMessage(m) {
     if (m.viewOnceMessage?.message) return unwrapMessage(m.viewOnceMessage.message);
     if (m.viewOnceMessageV2?.message) return unwrapMessage(m.viewOnceMessageV2.message);
     if (m.viewOnceMessageV2Extension?.message) return unwrapMessage(m.viewOnceMessageV2Extension.message);
+    if (m.documentWithCaptionMessage?.message) return unwrapMessage(m.documentWithCaptionMessage.message);
     return m;
 }
 
@@ -232,14 +233,16 @@ function getSystemPrompt(userIdentity, memoryContext, intent) {
 
     const sportRules = intent === 'SIMPLE_QUERY'
         ? `Reponds en 1 a 3 phrases courtes (3 a 6 si explication). Utilise Google Search si besoin.`
-        : `MOTEUR FOOT :
+        : `MOTEUR FOOT & TICKETS :
 - Utilise Google Search pour verifier l'existence du match (${date}, apres ${heure} a Lubumbashi), forme (5 derniers matchs), classement, buts, absents et H2H.
 - Si un match n'a pas lieu aujourd'hui, signale-le immediatement. N'invente JAMAIS de stats.
 - Pour chaque match, donne : *Victoire 1X2* • *Double Chance* • *Plus/Moins de buts* • *BTTS* • *Score probable* • *Option à risque réduit* avec justification factuelle.
-- Distingue *probabilités statistiques* et *estimations*. Si les donnees 2026 manquent, max *Confiance : 5/10 — Fiabilité : INSUFFISANTE* (jamais 10/10).`;
+- Distingue *probabilités statistiques* et *estimations*. Si les donnees 2026 manquent, max *Confiance : 5/10 — Fiabilité : INSUFFISANTE* (jamais 10/10).
+- Si on t'envoie une capture ou un ticket Betpawa, lis toutes les equipes/cotes sur l'image, repere les matchs pieges et donne un verdict clair.`;
 
     return `Tu es GIM SNEY, analyste sportif du groupe "Pronostic du sport". Createur : ILUNGA MONGA DIEUDONNE.
 Date : ${date}, ${heure} (Lubumbashi). ${greeting}${memBlock}
+CAPACITES MULTIMODALES ACTIVES : Tu VOIS parfaitement les images, captures d'ecran et tickets Betpawa, et tu ECOUTES les notes vocales envoyees dans le groupe. Si on te demande si tu peux voir une capture, reponds OUI (en precisant d'envoyer la capture avec !gim ou en reponse a un de tes messages). Ne dis JAMAIS que tu ne peux pas voir les captures d'ecran.
 STYLE STRICT : Direct, concis facon ChatGPT, sans remplissage ni phrases du type "Je vais maintenant chercher...".
 FORMAT WHATSAPP : Jamais de ### ni ** ni ---. Utilise *un seul asterisque* pour le gras et • pour les listes.
 ${sportRules}`;
@@ -255,7 +258,7 @@ async function askGemini(groupJid, userIdentity, question, media = null, modelIn
 
     const parts = [];
     if (media?.data) parts.push({ inline_data: { mime_type: media.mimeType, data: media.data } });
-    const promptText = question || (media?.kind === 'audio' ? "Ecoute ce vocal et reponds." : "Analyse ce ticket Betpawa via Google Search.");
+    const promptText = question || (media?.kind === 'audio' ? "Ecoute ce vocal et reponds." : "Analyse en detail cette capture d'ecran ou ce ticket de paris via Google Search.");
     parts.push({ text: `[${userIdentity.isCreator ? 'Boss Dieudonne' : userIdentity.displayName}] : ${promptText}` });
 
     try {
@@ -314,7 +317,7 @@ async function startBot() {
         }
 
         sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
-            if (connection === 'open') console.log('🎉 GIM SNEY PRO ACTIF (GROUPES + MEMOIRE PERSISTANTE) !');
+            if (connection === 'open') console.log('🎉 GIM SNEY PRO ACTIF (GROUPES + VISION + MEMOIRE) !');
             if (connection === 'close' && lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut) {
                 setTimeout(() => startBot(), 3000);
             }
@@ -332,12 +335,16 @@ async function startBot() {
                 const content = unwrapMessage(msg.message);
                 if (!content) continue;
 
-                const ctx = content.extendedTextMessage?.contextInfo || content.imageMessage?.contextInfo || content.audioMessage?.contextInfo;
+                const ctx = content.extendedTextMessage?.contextInfo || content.imageMessage?.contextInfo || content.audioMessage?.contextInfo || content.documentMessage?.contextInfo;
                 const quoted = unwrapMessage(ctx?.quotedMessage);
                 const isReplyToBot = Boolean(ctx?.stanzaId && botSentIds.has(ctx.stanzaId));
+
                 const img = content.imageMessage || quoted?.imageMessage;
+                const docImg = (content.documentMessage?.mimetype?.startsWith('image/') ? content.documentMessage : null) ||
+                               (quoted?.documentMessage?.mimetype?.startsWith('image/') ? quoted.documentMessage : null);
                 const audioMsg = content.audioMessage || quoted?.audioMessage;
-                const text = (content.conversation || content.extendedTextMessage?.text || content.imageMessage?.caption || "").trim();
+
+                const text = (content.conversation || content.extendedTextMessage?.text || content.imageMessage?.caption || content.documentMessage?.caption || "").trim();
                 const lower = text.toLowerCase();
 
                 const isCmd = lower.startsWith('!gim') || lower.startsWith('!prono') || lower.startsWith('pronostic') || lower.startsWith('/predict') || lower.includes('gimsney') || lower === 'football' || lower === '!reset' || lower === 'gimsney reset';
@@ -351,9 +358,10 @@ async function startBot() {
                 }
 
                 let media = null;
-                if (img) {
-                    const buf = await getMediaBuffer(img, 'image');
-                    if (buf) media = { kind: 'image', mimeType: (img.mimetype || 'image/jpeg').split(';')[0].trim(), data: buf.toString('base64') };
+                const targetImg = img || docImg;
+                if (targetImg) {
+                    const buf = await getMediaBuffer(targetImg, img ? 'image' : 'document');
+                    if (buf) media = { kind: 'image', mimeType: (targetImg.mimetype || 'image/jpeg').split(';')[0].trim(), data: buf.toString('base64') };
                 } else if (audioMsg) {
                     const buf = await getMediaBuffer(audioMsg, 'audio');
                     if (buf) media = { kind: 'audio', mimeType: (audioMsg.mimetype || 'audio/ogg').split(';')[0].trim(), data: buf.toString('base64') };
