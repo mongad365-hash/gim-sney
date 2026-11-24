@@ -1,4 +1,4 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadContentFromMessage } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, downloadContentFromMessage, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const http = require('http');
 const fs = require('fs');
@@ -305,21 +305,56 @@ async function askGemini(groupJid, userIdentity, question, media = null, modelIn
 async function startBot() {
     try {
         const { state, saveCreds } = await useMultiFileAuthState('session_auth');
-        const sock = makeWASocket({ logger: pino({ level: 'silent' }), auth: state, browser: ['Ubuntu', 'Chrome', '20.0.04'] });
+
+        let waVersion;
+        try {
+            const latest = await fetchLatestBaileysVersion();
+            waVersion = latest.version;
+            console.log(`[WA] Version protocole: ${waVersion.join('.')}`);
+        } catch (_) {}
+
+        const sock = makeWASocket({
+            logger: pino({ level: 'silent' }),
+            auth: state,
+            ...(waVersion ? { version: waVersion } : {}),
+            browser: ['Ubuntu', 'Chrome', '20.0.04']
+        });
+
+        let pairingRequested = false;
+        const triggerPairingCode = async () => {
+            if (pairingRequested || sock.authState.creds.registered) return;
+            pairingRequested = true;
+            try {
+                const code = await sock.requestPairingCode(CREATOR_PHONE);
+                console.log("\n=================================");
+                console.log("👉 CODE WHATSAPP : " + code);
+                console.log("=================================\n");
+            } catch (e) {
+                pairingRequested = false;
+                console.error("[WA] Erreur demande code:", e.message);
+            }
+        };
 
         if (!sock.authState.creds.registered) {
-            setTimeout(async () => {
-                try {
-                    const code = await sock.requestPairingCode(CREATOR_PHONE);
-                    console.log("\n👉 CODE WHATSAPP : " + code + "\n");
-                } catch (e) { console.error("Erreur code:", e.message); }
-            }, 6000);
+            console.log("[WA] Appareil non enregistre, generation du code en cours...");
+            setTimeout(triggerPairingCode, 5000);
         }
 
-        sock.ev.on('connection.update', ({ connection, lastDisconnect }) => {
-            if (connection === 'open') console.log('🎉 GIM SNEY PRO ACTIF (GROUPES + VISION + MEMOIRE) !');
-            if (connection === 'close' && lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut) {
-                setTimeout(() => startBot(), 3000);
+        sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
+            if (qr && !sock.authState.creds.registered) {
+                triggerPairingCode();
+            }
+            if (connection === 'open') {
+                console.log('🎉 GIM SNEY PRO ACTIF (GROUPES + VISION + MEMOIRE) !');
+            }
+            if (connection === 'close') {
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                console.log(`[WA] Connexion fermee (code: ${statusCode || 'inconnu'})`);
+                if (statusCode === DisconnectReason.loggedOut) {
+                    console.log('[WA] Session deconnectee, reinitialisation pour nouveau code...');
+                    try { fs.rmSync('session_auth', { recursive: true, force: true }); } catch (_) {}
+                }
+                setTimeout(() => startBot(), 4000);
             }
         });
 
@@ -382,6 +417,7 @@ async function startBot() {
             }
         });
     } catch (e) {
+        console.error("[WA] Erreur demarrage:", e.message);
         setTimeout(() => startBot(), 5000);
     }
 }
