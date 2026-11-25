@@ -3,6 +3,7 @@ const pino = require('pino');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
+const { CreatorMemoryEngine } = require('./creator_memory');
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AQ.Ab8RN6KeFgt7wruY4XiA-_lb7u5SjVftPUIq6kQTbA3VPv891A";
 const GEMINI_FALLBACK_MODELS = [...new Set([
@@ -29,7 +30,7 @@ http.createServer((req, res) => {
 setInterval(() => { fetch(SELF_URL).catch(() => {}); }, 10 * 60 * 1000);
 
 // ==========================================
-// MEMOIRE PERSISTANTE PAR UTILISATEUR
+// MEMOIRE PERSISTANTE PAR UTILISATEUR + DOSSIER CREATEUR
 // ==========================================
 function formatTimeAgo(isoDate) {
     if (!isoDate) return "premier echange";
@@ -63,15 +64,7 @@ class PersistentMemoryDB {
             try { record = JSON.parse(fs.readFileSync(filePath, 'utf8')); } catch (_) {}
         }
         if (!record || typeof record !== 'object') {
-            record = {
-                userId,
-                phone: /^\d+$/.test(userId) ? userId : null,
-                name: defaultName,
-                createdAt: new Date().toISOString(),
-                lastSeenAt: null,
-                longTermFacts: [],
-                recentMessages: []
-            };
+            record = { userId, phone: /^\d+$/.test(userId) ? userId : null, name: defaultName, createdAt: new Date().toISOString(), lastSeenAt: null, longTermFacts: [], recentMessages: [] };
         }
         if (!Array.isArray(record.longTermFacts)) record.longTermFacts = [];
         if (!Array.isArray(record.recentMessages)) record.recentMessages = [];
@@ -127,6 +120,7 @@ class PersistentMemoryDB {
 }
 
 const memoryDB = new PersistentMemoryDB();
+const creatorDB = new CreatorMemoryEngine({ dataDir: MEMORY_DB_DIR, authorizedPhone: CREATOR_PHONE });
 
 // ==========================================
 // UTILITAIRES WHATSAPP & IDENTITE
@@ -212,7 +206,7 @@ function classifySportsIntent(question = "", media = null) {
     return keys.some(k => q.includes(k)) || !q.trim() ? 'MATCH_ANALYSIS' : 'SIMPLE_QUERY';
 }
 
-function getSystemPrompt(userIdentity, memoryContext, intent) {
+function getSystemPrompt(userIdentity, memoryContext, creatorSearch, intent) {
     const now = new Date();
     const date = now.toLocaleDateString('fr-FR', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'Africa/Lubumbashi' });
     const heure = now.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Lubumbashi' });
@@ -224,12 +218,28 @@ function getSystemPrompt(userIdentity, memoryContext, intent) {
     const greeting = isImmediateFollowUp
         ? `Ne salue PAS a nouveau, reponds directement.`
         : isCreator
-        ? `Interlocuteur : Ton Createur ILUNGA MONGA DIEUDONNE. Salue en une courte phrase max (ex: "Bonjour Créateur ! 🫡 Voici...") puis reponds.`
+        ? `Interlocuteur : Ton Createur ILUNGA MONGA DIEUDONNE (+${CREATOR_PHONE}). Salue en une courte phrase calme et respectueuse puis reponds directement.`
         : `Interlocuteur : ${displayName}. Salue en quelques mots max puis reponds.`;
 
     const memBlock = record.longTermFacts.length > 0
-        ? `\nMEMOIRE PERSISTANTE (${userId}, dernier passage : ${timeSinceLastSeen}) :\n- ${record.longTermFacts.join('\n- ')}`
+        ? `\nHISTORIQUE DE CONVERSATION (${userId}, dernier passage : ${timeSinceLastSeen}) :\n- ${record.longTermFacts.join('\n- ')}`
         : (record.lastSeenAt ? `\nDernier echange avec ${userId} : ${timeSinceLastSeen}.` : '');
+
+    const creatorBioRule = `IDENTIFICATION OFFICIELLE DU CREATEUR :
+Si quelqu'un demande "Qui est le créateur de GIM SNEY ?", reponds exactement :
+"Mon créateur est ILUNGA MONGA DIEUDONNÉ, originaire de la République démocratique du Congo. C'est un passionné de sciences, de technologie, d'intelligence artificielle, de robotique et de connaissances scientifiques.
+
+Il nourrit le rêve de créer ses propres intelligences artificielles, de concevoir des robots intelligents et de fonder un grand institut scientifique et technologique en RDC : ILUNGA FUTURE LAB.
+
+Il souhaite apprendre, inventer, entreprendre et contribuer au développement scientifique et technologique de son pays."`;
+
+    const personalRules = isCreator
+        ? `\nREGLES PERSONNELLES POUR LE CREATEUR :
+- Adapte ton ton a sa personnalite : calme, reflechi, clair, sans exageration.
+- Ne modifie JAMAIS un nom ou une date, ne confonds jamais les generations, ne deduis aucun lien familial non confirme, respecte les sujets sensibles (aucune question sur sa mere biologique).
+- Distingue les connaissances scientifiques etablies des croyances spirituelles. N'impose aucune specialite universitaire.
+- Ne pretends JAMAIS avoir enregistre une nouvelle information durablement de toi-meme : indique-lui d'utiliser "!memo categorie | personne | information" pour l'enregistrer avec verification en base.\n${creatorSearch.contextText}`
+        : `\n${creatorSearch.contextText}`;
 
     const sportRules = intent === 'SIMPLE_QUERY'
         ? `Reponds en 1 a 3 phrases courtes (3 a 6 si explication). Utilise Google Search si besoin.`
@@ -240,9 +250,10 @@ function getSystemPrompt(userIdentity, memoryContext, intent) {
 - Distingue *probabilités statistiques* et *estimations*. Si les donnees 2026 manquent, max *Confiance : 5/10 — Fiabilité : INSUFFISANTE* (jamais 10/10).
 - Si on t'envoie une capture ou un ticket Betpawa, lis toutes les equipes/cotes sur l'image, repere les matchs pieges et donne un verdict clair.`;
 
-    return `Tu es GIM SNEY, analyste sportif du groupe "Pronostic du sport". Createur : ILUNGA MONGA DIEUDONNE.
+    return `Tu es GIM SNEY, assistant intelligent et analyste sportif cree par ILUNGA MONGA DIEUDONNE.
 Date : ${date}, ${heure} (Lubumbashi). ${greeting}${memBlock}
-CAPACITES MULTIMODALES ACTIVES : Tu VOIS parfaitement les images, captures d'ecran et tickets Betpawa, et tu ECOUTES les notes vocales envoyees dans le groupe. Si on te demande si tu peux voir une capture, reponds OUI (en precisant d'envoyer la capture avec !gim ou en reponse a un de tes messages). Ne dis JAMAIS que tu ne peux pas voir les captures d'ecran.
+${creatorBioRule}${personalRules}
+CAPACITES MULTIMODALES ACTIVES : Tu VOIS parfaitement les images, captures d'ecran et tickets Betpawa, et tu ECOUTES les notes vocales envoyees dans le groupe.
 STYLE STRICT : Direct, concis facon ChatGPT, sans remplissage ni phrases du type "Je vais maintenant chercher...".
 FORMAT WHATSAPP : Jamais de ### ni ** ni ---. Utilise *un seul asterisque* pour le gras et • pour les listes.
 ${sportRules}`;
@@ -253,6 +264,7 @@ async function askGemini(groupJid, userIdentity, question, media = null, modelIn
     if (!modelName) throw new Error("Quota journalier atteint sur tous les modeles.");
 
     const memoryContext = memoryDB.getGeminiHistory(userIdentity.userId, userIdentity.displayName);
+    const creatorSearch = creatorDB.searchRelevant(question || "", userIdentity.isCreator);
     const intent = classifySportsIntent(question, media);
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${GEMINI_API_KEY}`;
 
@@ -266,7 +278,7 @@ async function askGemini(groupJid, userIdentity, question, media = null, modelIn
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                system_instruction: { parts: [{ text: getSystemPrompt(userIdentity, memoryContext, intent) }] },
+                system_instruction: { parts: [{ text: getSystemPrompt(userIdentity, memoryContext, creatorSearch, intent) }] },
                 contents: [...memoryContext.geminiHistory, { role: "user", parts }],
                 tools: [{ google_search: {} }],
                 generationConfig: { temperature: 0.2, maxOutputTokens: 4096 }
@@ -310,7 +322,6 @@ async function startBot() {
         try {
             const latest = await fetchLatestBaileysVersion();
             waVersion = latest.version;
-            console.log(`[WA] Version protocole: ${waVersion.join('.')}`);
         } catch (_) {}
 
         const sock = makeWASocket({
@@ -336,22 +347,15 @@ async function startBot() {
         };
 
         if (!sock.authState.creds.registered) {
-            console.log("[WA] Appareil non enregistre, generation du code en cours...");
             setTimeout(triggerPairingCode, 5000);
         }
 
         sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
-            if (qr && !sock.authState.creds.registered) {
-                triggerPairingCode();
-            }
-            if (connection === 'open') {
-                console.log('🎉 GIM SNEY PRO ACTIF (GROUPES + VISION + MEMOIRE) !');
-            }
+            if (qr && !sock.authState.creds.registered) triggerPairingCode();
+            if (connection === 'open') console.log(`🎉 GIM SNEY PRO ACTIF (${creatorDB.getStatsSummary()}) !`);
             if (connection === 'close') {
                 const statusCode = lastDisconnect?.error?.output?.statusCode;
-                console.log(`[WA] Connexion fermee (code: ${statusCode || 'inconnu'})`);
                 if (statusCode === DisconnectReason.loggedOut) {
-                    console.log('[WA] Session deconnectee, reinitialisation pour nouveau code...');
                     try { fs.rmSync('session_auth', { recursive: true, force: true }); } catch (_) {}
                 }
                 setTimeout(() => startBot(), 4000);
@@ -382,13 +386,56 @@ async function startBot() {
                 const text = (content.conversation || content.extendedTextMessage?.text || content.imageMessage?.caption || content.documentMessage?.caption || "").trim();
                 const lower = text.toLowerCase();
 
-                const isCmd = lower.startsWith('!gim') || lower.startsWith('!prono') || lower.startsWith('pronostic') || lower.startsWith('/predict') || lower.includes('gimsney') || lower === 'football' || lower === '!reset' || lower === 'gimsney reset';
+                const isMemoryCmd = lower.startsWith('!memo') || lower.startsWith('!corrige') || lower.startsWith('!supprime') || lower.startsWith('!cherchememo') || lower === '!memostats';
+                const isCmd = isMemoryCmd || lower.startsWith('!gim') || lower.startsWith('!prono') || lower.startsWith('pronostic') || lower.startsWith('/predict') || lower.includes('gimsney') || lower === 'football' || lower === '!reset' || lower === 'gimsney reset';
                 if (!isCmd && !isReplyToBot) continue;
 
                 const userIdentity = await resolveUserIdentity(msg, sock);
+
+                // Commandes de gestion directe de la memoire du Createur (protegees par +243977332867)
+                if (isMemoryCmd) {
+                    if (!userIdentity.isCreator) {
+                        await sendTracked(sock, sender, { text: "🔒 Commande réservée uniquement au Créateur." }, { quoted: msg });
+                        continue;
+                    }
+                    if (lower === '!memostats') {
+                        const bkp = creatorDB.createBackup();
+                        await sendTracked(sock, sender, { text: `📊 *Base Mémoire Créateur*\n${creatorDB.getStatsSummary()}\n💾 Sauvegarde créée : ${path.basename(bkp)}` }, { quoted: msg });
+                        continue;
+                    }
+                    if (lower.startsWith('!memo ')) {
+                        const parts = text.slice(6).split('|').map(s => s.trim());
+                        const [category, person_name, information] = parts.length >= 3 ? parts : ['personnel', 'ILUNGA MONGA DIEUDONNÉ', parts.join(' ')];
+                        if (!information) {
+                            await sendTracked(sock, sender, { text: "Format : *!memo catégorie | personne | information*" }, { quoted: msg });
+                            continue;
+                        }
+                        const res = creatorDB.addMemory({ category, person_name, information, actorPhone: userIdentity.phone });
+                        await sendTracked(sock, sender, { text: res.saved ? `✅ Enregistré et vérifié (${res.backend.toUpperCase()}) | ID : *${res.id}*` : `❌ Échec d'enregistrement : ${res.reason}` }, { quoted: msg });
+                        continue;
+                    }
+                    if (lower.startsWith('!corrige ')) {
+                        const [id, ...rest] = text.slice(9).split('|').map(s => s.trim());
+                        const res = creatorDB.updateMemory(id, rest.join(' | '), userIdentity.phone);
+                        await sendTracked(sock, sender, { text: res.updated ? `✅ Souvenir *${id}* mis à jour et vérifié.` : `❌ ${res.reason}` }, { quoted: msg });
+                        continue;
+                    }
+                    if (lower.startsWith('!supprime ')) {
+                        const id = text.slice(10).trim();
+                        const res = creatorDB.deleteMemory(id, userIdentity.phone);
+                        await sendTracked(sock, sender, { text: res.deleted ? `🗑️ Souvenir *${id}* supprimé.` : `❌ ${res.reason}` }, { quoted: msg });
+                        continue;
+                    }
+                    if (lower.startsWith('!cherchememo ')) {
+                        const res = creatorDB.searchRelevant(text.slice(13).trim(), true);
+                        await sendTracked(sock, sender, { text: res.contextText.slice(0, 3500) }, { quoted: msg });
+                        continue;
+                    }
+                }
+
                 if (lower === '!reset' || lower === 'gimsney reset') {
                     memoryDB.clearUserMemory(userIdentity.userId);
-                    await sendTracked(sock, sender, { text: `🧹 Memoire personnelle reinitialisee, ${userIdentity.displayName} ! ⚽` }, { quoted: msg });
+                    await sendTracked(sock, sender, { text: `🧹 Memoire conversationnelle reinitialisee, ${userIdentity.displayName} ! ⚽` }, { quoted: msg });
                     continue;
                 }
 
