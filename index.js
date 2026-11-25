@@ -3,7 +3,9 @@ const pino = require('pino');
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { CreatorMemoryEngine } = require('./creator_memory');
+
+let DatabaseSync = null;
+try { ({ DatabaseSync } = require('node:sqlite')); } catch (_) { DatabaseSync = null; }
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AQ.Ab8RN6KeFgt7wruY4XiA-_lb7u5SjVftPUIq6kQTbA3VPv891A";
 const GEMINI_FALLBACK_MODELS = [...new Set([
@@ -30,7 +32,191 @@ http.createServer((req, res) => {
 setInterval(() => { fetch(SELF_URL).catch(() => {}); }, 10 * 60 * 1000);
 
 // ==========================================
-// MEMOIRE PERSISTANTE PAR UTILISATEUR + DOSSIER CREATEUR
+// BASE PERSONNELLE DU CREATEUR (SQLITE / JSON)
+// ==========================================
+class CreatorMemoryEngine {
+    constructor(dataDir = MEMORY_DB_DIR, authorizedPhone = CREATOR_PHONE) {
+        this.dataDir = dataDir;
+        this.backupDir = path.join(this.dataDir, 'backups');
+        this.authorizedPhone = String(authorizedPhone).replace(/\D/g, '');
+        this.sqlitePath = path.join(this.dataDir, 'creator_memory.sqlite');
+        this.jsonPath = path.join(this.dataDir, 'creator_memory.json');
+        this.backend = 'json';
+        this.db = null;
+        this.state = { persons: [], family_relations: [], events: [], projects: [], memories: [], memory_audit_log: [] };
+
+        if (!fs.existsSync(this.dataDir)) fs.mkdirSync(this.dataDir, { recursive: true });
+        if (!fs.existsSync(this.backupDir)) fs.mkdirSync(this.backupDir, { recursive: true });
+        this.initStorage();
+        this.seedOfficialDossier();
+    }
+
+    initStorage() {
+        if (DatabaseSync) {
+            try {
+                this.db = new DatabaseSync(this.sqlitePath);
+                this.db.exec(`
+                    CREATE TABLE IF NOT EXISTS persons (id TEXT PRIMARY KEY, full_name TEXT NOT NULL, role_or_relation TEXT NOT NULL, birth_date TEXT, death_date TEXT, origin TEXT, location TEXT, age_declared TEXT, confirmation_level TEXT NOT NULL, sensitive INTEGER DEFAULT 0, notes TEXT, source TEXT NOT NULL, updated_at TEXT NOT NULL);
+                    CREATE TABLE IF NOT EXISTS family_relations (id TEXT PRIMARY KEY, from_person_id TEXT NOT NULL, to_person_id TEXT NOT NULL, relation_type TEXT NOT NULL, generation_note TEXT, confirmation_level TEXT NOT NULL, source TEXT NOT NULL, updated_at TEXT NOT NULL);
+                    CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, title TEXT NOT NULL, event_date TEXT, person_id TEXT, description TEXT NOT NULL, confirmation_level TEXT NOT NULL, source TEXT NOT NULL, updated_at TEXT NOT NULL);
+                    CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT NOT NULL, founder TEXT NOT NULL, motto TEXT, location TEXT, vision TEXT NOT NULL, departments TEXT, status TEXT NOT NULL, confirmation_level TEXT NOT NULL, source TEXT NOT NULL, updated_at TEXT NOT NULL);
+                    CREATE TABLE IF NOT EXISTS memories (id TEXT PRIMARY KEY, category TEXT NOT NULL, person_name TEXT NOT NULL, information TEXT NOT NULL, communicated_at TEXT NOT NULL, confirmation_level TEXT NOT NULL, source TEXT NOT NULL, sensitive INTEGER DEFAULT 0, owner_phone TEXT NOT NULL, updated_at TEXT NOT NULL);
+                    CREATE TABLE IF NOT EXISTS memory_audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, memory_id TEXT NOT NULL, action TEXT NOT NULL, old_value TEXT, new_value TEXT, actor_phone TEXT NOT NULL, created_at TEXT NOT NULL);
+                `);
+                this.backend = 'sqlite';
+                return;
+            } catch (e) {
+                console.warn('[CREATOR_DB] SQLite ignore, bascule JSON:', e.message);
+                this.db = null;
+            }
+        }
+        if (fs.existsSync(this.jsonPath)) {
+            try { this.state = JSON.parse(fs.readFileSync(this.jsonPath, 'utf8')) || this.state; } catch (_) {}
+        }
+        this.persistJson();
+    }
+
+    persistJson() {
+        if (this.backend !== 'json') return;
+        const tmp = `${this.jsonPath}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(this.state, null, 2), 'utf8');
+        fs.renameSync(tmp, this.jsonPath);
+    }
+
+    upsert(table, row, cols) {
+        const now = new Date().toISOString();
+        const r = { ...row, updated_at: now };
+        if (this.backend === 'sqlite') {
+            const placeholders = cols.map(() => '?').join(', ');
+            const updates = cols.slice(1).map(c => `${c}=excluded.${c}`).join(', ');
+            this.db.prepare(`INSERT INTO ${table} (${cols.join(', ')}) VALUES (${placeholders}) ON CONFLICT(id) DO UPDATE SET ${updates}`)
+                .run(...cols.map(c => (r[c] === undefined ? null : r[c])));
+        } else {
+            const arr = this.state[table];
+            const i = arr.findIndex(x => x.id === r.id);
+            if (i >= 0) arr[i] = r; else arr.push(r);
+            this.persistJson();
+        }
+    }
+
+    getMemoryById(id) {
+        return this.backend === 'sqlite'
+            ? (this.db.prepare(`SELECT * FROM memories WHERE id = ?`).get(id) || null)
+            : (this.state.memories.find(m => m.id === id) || null);
+    }
+
+    seedOfficialDossier() {
+        const src = 'Instruction Maitresse (2026-11-25)';
+        const pCols = ['id', 'full_name', 'role_or_relation', 'birth_date', 'death_date', 'origin', 'location', 'age_declared', 'confirmation_level', 'sensitive', 'notes', 'source', 'updated_at'];
+        [
+            { id: 'dieudonne', full_name: 'ILUNGA MONGA DIEUDONNÉ', role_or_relation: 'Créateur et fondateur', location: 'Fungurume, province du Lualaba, RDC', origin: 'République démocratique du Congo', confirmation_level: 'confirmee', sensitive: 0, notes: 'Sixième secondaire scientifique. Calme, silencieux, réservé, réfléchi, aime les endroits tranquilles, parle lentement, réfléchit avant d’agir. Philosophie, silence, beauté, Dieu Créateur, Bible, science/spiritualité. Objectif: bonne vie et être heureux. WhatsApp: +243977332867.', source: src },
+            { id: 'leon', full_name: 'ILUNGA MONGA LÉON', role_or_relation: 'Père de Dieudonné (décédé)', birth_date: '1966-05-08', death_date: '2025-01-23', origin: 'Kikamba, territoire de Kongolo, Tanganyika', location: 'Haut-Katanga (jusqu’au décès)', confirmation_level: 'declaree', sensitive: 0, notes: 'Professions déclarées: agronome et médecin. Mémoire à respecter.', source: src },
+            { id: 'eaudilake', full_name: 'ILUNGA EAUDILAKE', role_or_relation: 'Grand-père paternel', age_declared: '98 ans au moment de la communication', origin: 'Kikamba, Kaseya, près de Kongolo, Tanganyika', confirmation_level: 'declaree', sensitive: 0, notes: '7 enfants: ILUNGA MONGA LÉON, ILUNGA PAUL, ILUNGA KAZADI, ILUNGA POULIE, ILUNGA MAWA, ILUNGA JULLE, ILUNGA BERNARD.', source: src },
+            { id: 'paul', full_name: 'ILUNGA PAUL', role_or_relation: 'Enfant d’ILUNGA EAUDILAKE', confirmation_level: 'declaree', sensitive: 0, source: src },
+            { id: 'kazadi', full_name: 'ILUNGA KAZADI', role_or_relation: 'Enfant d’ILUNGA EAUDILAKE', confirmation_level: 'declaree', sensitive: 0, source: src },
+            { id: 'poulie', full_name: 'ILUNGA POULIE', role_or_relation: 'Enfant d’ILUNGA EAUDILAKE', confirmation_level: 'declaree', sensitive: 0, source: src },
+            { id: 'mawa', full_name: 'ILUNGA MAWA', role_or_relation: 'Enfant d’ILUNGA EAUDILAKE', confirmation_level: 'declaree', sensitive: 0, source: src },
+            { id: 'julle', full_name: 'ILUNGA JULLE', role_or_relation: 'Enfant d’ILUNGA EAUDILAKE', confirmation_level: 'declaree', sensitive: 0, source: src },
+            { id: 'bernard', full_name: 'ILUNGA BERNARD', role_or_relation: 'Enfant d’ILUNGA EAUDILAKE', confirmation_level: 'declaree', sensitive: 0, source: src },
+            { id: 'christine', full_name: 'MULIMBI CHRISTINE', role_or_relation: 'Deuxième mère (2e épouse d’ILUNGA MONGA LÉON)', location: 'Lubumbashi (après le décès)', confirmation_level: 'confirmee', sensitive: 0, notes: 'Rôle maternel important depuis 2012. Dieudonné l’aime profondément.', source: src },
+            { id: 'melanie', full_name: 'ILUNGA MÉLANIE JACQUELINE', role_or_relation: 'Sœur de Dieudonné', confirmation_level: 'declaree', sensitive: 0, source: src },
+            { id: 'odilon', full_name: 'ILUNGA MBUYA ODILON', role_or_relation: 'Frère de Dieudonné', confirmation_level: 'declaree', sensitive: 0, source: src },
+            { id: 'mariam', full_name: 'MARIAM', role_or_relation: 'Membre de la famille (lien précis à confirmer)', location: 'Kongolo (vit avec sa mère)', confirmation_level: 'declaree', sensitive: 0, source: src }
+        ].forEach(p => this.upsert('persons', p, pCols));
+
+        const prCols = ['id', 'name', 'founder', 'motto', 'location', 'vision', 'departments', 'status', 'confirmation_level', 'source', 'updated_at'];
+        [
+            { id: 'proj_future_lab', name: 'ILUNGA FUTURE LAB', founder: 'ILUNGA MONGA DIEUDONNÉ', motto: 'THE FUTURE BEGINS WITH SCIENCE', location: 'RDC — grande montagne forêt congolaise', vision: 'Immense laboratoire futuriste inspiré du laboratoire de Kaal (Krrish 3).', departments: 'IA, Chimie, Informatique, Biologie, Médecine/Biotechnologie, Astronomie/Espace, Énergie/Technologies avancées', status: 'Rêve à long terme', confirmation_level: 'confirmee', source: src },
+            { id: 'proj_gim_sney', name: 'GIM SNEY', founder: 'ILUNGA MONGA DIEUDONNÉ', location: 'WhatsApp', vision: 'Assistant intelligent (sport, connaissances, recherche, PDF/photos, assistance personnelle, mémoire persistante).', departments: 'Sport, IA, Vision, Mémoire', status: 'Actif', confirmation_level: 'confirmee', source: src },
+            { id: 'proj_jarvis', name: 'J.A.R.V.I.S. AI Business Hub RDC', founder: 'ILUNGA MONGA DIEUDONNÉ', location: 'RDC', vision: 'Assistant personnel intelligent et plateforme technologique.', departments: 'IA, Automatisation', status: 'En développement', confirmation_level: 'confirmee', source: src }
+        ].forEach(pr => this.upsert('projects', pr, prCols));
+
+        const mCols = ['id', 'category', 'person_name', 'information', 'communicated_at', 'confirmation_level', 'source', 'sensitive', 'owner_phone', 'updated_at'];
+        [
+            { id: 'mem_whatsapp', category: 'identite', person_name: 'ILUNGA MONGA DIEUDONNÉ', information: 'WhatsApp officiel confirmé : +243977332867.', communicated_at: '2026-11-25', confirmation_level: 'confirmee', source: 'WhatsApp', sensitive: 0, owner_phone: this.authorizedPhone },
+            { id: 'mem_etudes', category: 'etudes', person_name: 'ILUNGA MONGA DIEUDONNÉ', information: '6e secondaire scientifique. Intérêts: biologie, robotique, IA, informatique, astronomie, géographie, histoire, écologie, chimie, technologies avancées. Spécialité universitaire non choisie (ne rien imposer).', communicated_at: '2026-11-25', confirmation_level: 'confirmee', source: src, sensitive: 0, owner_phone: this.authorizedPhone },
+            { id: 'mem_reves', category: 'ambitions', person_name: 'ILUNGA MONGA DIEUDONNÉ', information: 'Rêves: créer robot intelligent, IA avancée, logiciels, découvertes scientifiques, comprendre le vivant et l’univers, inventer des technologies.', communicated_at: '2026-11-25', confirmation_level: 'confirmee', source: src, sensitive: 0, owner_phone: this.authorizedPhone },
+            { id: 'mem_sensible', category: 'sensible', person_name: 'ILUNGA MONGA DIEUDONNÉ', information: 'Absence de sa mère biologique pendant l’enfance : sujet sensible, ne pas poser de questions intrusives ou répétitives.', communicated_at: '2026-11-25', confirmation_level: 'confirmee', source: src, sensitive: 1, owner_phone: this.authorizedPhone }
+        ].forEach(m => { if (!this.getMemoryById(m.id)) this.upsert('memories', m, mCols); });
+    }
+
+    logAudit(memoryId, action, oldVal, newVal, phone) {
+        const now = new Date().toISOString();
+        if (this.backend === 'sqlite') {
+            this.db.prepare(`INSERT INTO memory_audit_log (memory_id, action, old_value, new_value, actor_phone, created_at) VALUES (?, ?, ?, ?, ?, ?)`)
+                .run(memoryId, action, oldVal || null, newVal || null, phone, now);
+        } else {
+            this.state.memory_audit_log.push({ id: this.state.memory_audit_log.length + 1, memory_id: memoryId, action, old_value: oldVal || null, new_value: newVal || null, actor_phone: phone, created_at: now });
+            this.persistJson();
+        }
+    }
+
+    addMemory({ category = 'general', person_name = 'ILUNGA MONGA DIEUDONNÉ', information, actorPhone }) {
+        if (String(actorPhone).replace(/\D/g, '') !== this.authorizedPhone) return { saved: false, reason: 'Accès refusé.' };
+        const id = `mem_${Date.now()}`;
+        const now = new Date().toISOString();
+        const mCols = ['id', 'category', 'person_name', 'information', 'communicated_at', 'confirmation_level', 'source', 'sensitive', 'owner_phone', 'updated_at'];
+        this.upsert('memories', { id, category, person_name, information: information.trim(), communicated_at: now.slice(0, 10), confirmation_level: 'confirmee', source: 'WhatsApp Créateur', sensitive: 0, owner_phone: this.authorizedPhone }, mCols);
+        this.logAudit(id, 'CREATE', null, information.trim(), this.authorizedPhone);
+        const v = this.getMemoryById(id);
+        return { saved: Boolean(v), id, backend: this.backend };
+    }
+
+    updateMemory(id, newInfo, actorPhone) {
+        if (String(actorPhone).replace(/\D/g, '') !== this.authorizedPhone) return { updated: false, reason: 'Accès refusé.' };
+        const old = this.getMemoryById(id);
+        if (!old) return { updated: false, reason: `ID ${id} introuvable.` };
+        const now = new Date().toISOString();
+        if (this.backend === 'sqlite') {
+            this.db.prepare(`UPDATE memories SET information = ?, updated_at = ? WHERE id = ?`).run(newInfo.trim(), now, id);
+        } else {
+            old.information = newInfo.trim(); old.updated_at = now; this.persistJson();
+        }
+        this.logAudit(id, 'UPDATE', old.information, newInfo.trim(), this.authorizedPhone);
+        return { updated: true };
+    }
+
+    deleteMemory(id, actorPhone) {
+        if (String(actorPhone).replace(/\D/g, '') !== this.authorizedPhone) return { deleted: false, reason: 'Accès refusé.' };
+        const old = this.getMemoryById(id);
+        if (!old) return { deleted: false, reason: `ID ${id} introuvable.` };
+        if (this.backend === 'sqlite') this.db.prepare(`DELETE FROM memories WHERE id = ?`).run(id);
+        else { this.state.memories = this.state.memories.filter(m => m.id !== id); this.persistJson(); }
+        this.logAudit(id, 'DELETE', old.information, null, this.authorizedPhone);
+        return { deleted: !this.getMemoryById(id) };
+    }
+
+    createBackup() {
+        const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const ext = this.backend === 'sqlite' ? 'sqlite' : 'json';
+        const dest = path.join(this.backupDir, `backup_${stamp}.${ext}`);
+        fs.copyFileSync(this.backend === 'sqlite' ? this.sqlitePath : this.jsonPath, dest);
+        return dest;
+    }
+
+    searchRelevant(query = "", isCreator = false) {
+        if (!isCreator) return { authorized: false, contextText: `ACCES RESTREINT : Ne divulgue pas la vie privée du Créateur.` };
+        const persons = this.backend === 'sqlite' ? this.db.prepare(`SELECT * FROM persons`).all() : this.state.persons;
+        const projects = this.backend === 'sqlite' ? this.db.prepare(`SELECT * FROM projects`).all() : this.state.projects;
+        const memories = this.backend === 'sqlite' ? this.db.prepare(`SELECT * FROM memories`).all() : this.state.memories;
+        const lines = [
+            `[BASE CREATEUR (${this.backend.toUpperCase()}) +${this.authorizedPhone}]`,
+            ...persons.map(p => `- ${p.full_name} (${p.role_or_relation}) [${p.confirmation_level}]${p.birth_date ? ` Né:${p.birth_date}` : ''}${p.death_date ? ` Décès:${p.death_date}` : ''}${p.origin ? ` Origine:${p.origin}` : ''}${p.location ? ` Lieu:${p.location}` : ''}${p.notes ? ` | ${p.notes}` : ''}`),
+            ...projects.map(pr => `- Projet ${pr.name} : ${pr.vision}${pr.motto ? ` (${pr.motto})` : ''}`),
+            ...memories.slice(-10).map(m => `- [${m.id}|${m.category}] ${m.information}`)
+        ];
+        return { authorized: true, contextText: lines.join('\n') };
+    }
+
+    getStatsSummary() {
+        const p = this.backend === 'sqlite' ? this.db.prepare(`SELECT COUNT(*) c FROM persons`).get().c : this.state.persons.length;
+        const m = this.backend === 'sqlite' ? this.db.prepare(`SELECT COUNT(*) c FROM memories`).get().c : this.state.memories.length;
+        return `${this.backend.toUpperCase()} | Personnes: ${p} | Souvenirs: ${m}`;
+    }
+}
+
+// ==========================================
+// MEMOIRE DES CONVERSATIONS PAR UTILISATEUR
 // ==========================================
 function formatTimeAgo(isoDate) {
     if (!isoDate) return "premier echange";
@@ -58,33 +244,27 @@ class PersistentMemoryDB {
     }
     loadUser(userId, defaultName = "Membre") {
         if (this.cache.has(userId)) return this.cache.get(userId);
-        const filePath = this.getFilePath(userId);
-        let record = null;
-        if (fs.existsSync(filePath)) {
-            try { record = JSON.parse(fs.readFileSync(filePath, 'utf8')); } catch (_) {}
-        }
-        if (!record || typeof record !== 'object') {
-            record = { userId, phone: /^\d+$/.test(userId) ? userId : null, name: defaultName, createdAt: new Date().toISOString(), lastSeenAt: null, longTermFacts: [], recentMessages: [] };
-        }
-        if (!Array.isArray(record.longTermFacts)) record.longTermFacts = [];
-        if (!Array.isArray(record.recentMessages)) record.recentMessages = [];
-        this.cache.set(userId, record);
-        return record;
+        const fp = this.getFilePath(userId);
+        let rec = null;
+        if (fs.existsSync(fp)) { try { rec = JSON.parse(fs.readFileSync(fp, 'utf8')); } catch (_) {} }
+        if (!rec || typeof rec !== 'object') rec = { userId, name: defaultName, lastSeenAt: null, longTermFacts: [], recentMessages: [] };
+        if (!Array.isArray(rec.longTermFacts)) rec.longTermFacts = [];
+        if (!Array.isArray(rec.recentMessages)) rec.recentMessages = [];
+        this.cache.set(userId, rec);
+        return rec;
     }
-    saveUser(record) {
-        if (!fs.existsSync(this.dbDir)) fs.mkdirSync(this.dbDir, { recursive: true });
-        const filePath = this.getFilePath(record.userId);
-        const tmpPath = `${filePath}.tmp`;
-        fs.writeFileSync(tmpPath, JSON.stringify(record, null, 2), 'utf8');
-        fs.renameSync(tmpPath, filePath);
-        this.cache.set(record.userId, record);
+    saveUser(rec) {
+        const fp = this.getFilePath(rec.userId);
+        const tmp = `${fp}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(rec, null, 2), 'utf8');
+        fs.renameSync(tmp, fp);
+        this.cache.set(rec.userId, rec);
     }
     getGeminiHistory(userId, defaultName) {
         const record = this.loadUser(userId, defaultName);
         const validPairs = [];
         for (let i = 0; i + 1 < record.recentMessages.length; i++) {
-            const u = record.recentMessages[i];
-            const m = record.recentMessages[i + 1];
+            const u = record.recentMessages[i], m = record.recentMessages[i + 1];
             if (u?.role === 'user' && m?.role === 'model' && u.text && m.text) {
                 validPairs.push({ role: 'user', parts: [{ text: u.text }] }, { role: 'model', parts: [{ text: m.text }] });
                 i++;
@@ -92,25 +272,19 @@ class PersistentMemoryDB {
         }
         return { record, geminiHistory: validPairs.slice(-this.windowSize), timeSinceLastSeen: formatTimeAgo(record.lastSeenAt) };
     }
-    appendExchange(userIdentity, userText, botReply, meta = {}) {
-        const record = this.loadUser(userIdentity.userId, userIdentity.displayName);
+    appendExchange(userIdentity, userText, botReply) {
+        const rec = this.loadUser(userIdentity.userId, userIdentity.displayName);
         const nowIso = new Date().toISOString();
-        if (userIdentity.displayName) record.name = userIdentity.displayName;
-        if (userIdentity.phone) record.phone = userIdentity.phone;
-        record.lastSeenAt = nowIso;
-        record.recentMessages.push(
-            { role: 'user', text: userText, timestamp: nowIso, groupJid: meta.groupJid || null },
-            { role: 'model', text: botReply, timestamp: nowIso, groupJid: meta.groupJid || null }
-        );
-        while (record.recentMessages.length > this.windowSize) {
-            const oldU = record.recentMessages.shift();
-            const oldM = record.recentMessages[0]?.role === 'model' ? record.recentMessages.shift() : null;
-            if (oldU?.text) {
-                record.longTermFacts.push(`[${(oldU.timestamp || nowIso).slice(0, 10)}] "${oldU.text.replace(/\s+/g, ' ').slice(0, 100)}" -> "${(oldM?.text || '').replace(/\s+/g, ' ').slice(0, 100)}"`);
-            }
+        rec.name = userIdentity.displayName || rec.name;
+        rec.lastSeenAt = nowIso;
+        rec.recentMessages.push({ role: 'user', text: userText, timestamp: nowIso }, { role: 'model', text: botReply, timestamp: nowIso });
+        while (rec.recentMessages.length > this.windowSize) {
+            const oldU = rec.recentMessages.shift();
+            const oldM = rec.recentMessages[0]?.role === 'model' ? rec.recentMessages.shift() : null;
+            if (oldU?.text) rec.longTermFacts.push(`[${nowIso.slice(0, 10)}] "${oldU.text.slice(0, 100)}" -> "${(oldM?.text || '').slice(0, 100)}"`);
         }
-        if (record.longTermFacts.length > this.maxFacts) record.longTermFacts = record.longTermFacts.slice(-this.maxFacts);
-        this.saveUser(record);
+        if (rec.longTermFacts.length > this.maxFacts) rec.longTermFacts = rec.longTermFacts.slice(-this.maxFacts);
+        this.saveUser(rec);
     }
     clearUserMemory(userId) {
         this.cache.delete(userId);
@@ -120,10 +294,15 @@ class PersistentMemoryDB {
 }
 
 const memoryDB = new PersistentMemoryDB();
-const creatorDB = new CreatorMemoryEngine({ dataDir: MEMORY_DB_DIR, authorizedPhone: CREATOR_PHONE });
+let creatorDB = null;
+try {
+    creatorDB = new CreatorMemoryEngine();
+} catch (err) {
+    console.error('[CREATOR_DB INIT ERREUR]:', err.message);
+}
 
 // ==========================================
-// UTILITAIRES WHATSAPP & IDENTITE
+// UTILITAIRES WHATSAPP & GEMINI
 // ==========================================
 function extractPhoneFromJid(jid = "") {
     if (!jid || jid.endsWith('@g.us') || jid.endsWith('@lid')) return "";
@@ -131,26 +310,16 @@ function extractPhoneFromJid(jid = "") {
 }
 
 async function resolveUserIdentity(msg, sock) {
-    const participant = msg?.key?.participant || "";
-    const participantAlt = msg?.key?.participantAlt || "";
-    const isFromMe = Boolean(msg?.key?.fromMe);
-    let phone = extractPhoneFromJid(participantAlt) || extractPhoneFromJid(participant);
-
-    if (!phone && participant.endsWith('@lid') && sock?.signalRepository?.lidMapping?.getPNForLID) {
-        try { phone = extractPhoneFromJid(await sock.signalRepository.lidMapping.getPNForLID(participant)); } catch (_) {}
+    const p = msg?.key?.participant || "", alt = msg?.key?.participantAlt || "", fromMe = Boolean(msg?.key?.fromMe);
+    let phone = extractPhoneFromJid(alt) || extractPhoneFromJid(p);
+    if (!phone && p.endsWith('@lid') && sock?.signalRepository?.lidMapping?.getPNForLID) {
+        try { phone = extractPhoneFromJid(await sock.signalRepository.lidMapping.getPNForLID(p)); } catch (_) {}
     }
-    if (!phone && isFromMe) phone = CREATOR_PHONE;
-
-    const isCreator = isFromMe || phone === CREATOR_PHONE || participant.includes(CREATOR_PHONE) || participantAlt.includes(CREATOR_PHONE);
+    if (!phone && fromMe) phone = CREATOR_PHONE;
+    const isCreator = fromMe || phone === CREATOR_PHONE || p.includes(CREATOR_PHONE) || alt.includes(CREATOR_PHONE);
     if (isCreator && !phone) phone = CREATOR_PHONE;
-
-    const rawLid = participant.endsWith('@lid') ? participant.split('@')[0].split(':')[0].replace(/\W/g, '') : '';
-    return {
-        userId: phone || (rawLid ? `lid_${rawLid}` : 'unknown'),
-        phone: phone || null,
-        isCreator,
-        displayName: msg?.pushName || (isCreator ? "Boss Dieudonne" : "Frerot")
-    };
+    const rawLid = p.endsWith('@lid') ? p.split('@')[0].split(':')[0].replace(/\W/g, '') : '';
+    return { userId: phone || (rawLid ? `lid_${rawLid}` : 'unknown'), phone: phone || null, isCreator, displayName: msg?.pushName || (isCreator ? "Boss Dieudonne" : "Frerot") };
 }
 
 function unwrapMessage(m) {
@@ -180,10 +349,7 @@ async function getMediaBuffer(mediaMsg, type = 'image') {
         let buffer = Buffer.from([]);
         for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
         return buffer;
-    } catch (e) {
-        console.error(`Erreur ${type}:`, e.message);
-        return null;
-    }
+    } catch (e) { return null; }
 }
 
 async function sendTracked(sock, jid, content, options = {}) {
@@ -195,9 +361,6 @@ async function sendTracked(sock, jid, content, options = {}) {
     return sent;
 }
 
-// ==========================================
-// MOTEUR FOOTBALL & GEMINI
-// ==========================================
 function classifySportsIntent(question = "", media = null) {
     if (media?.kind === 'image') return 'TICKET_AUDIT';
     if (media?.kind === 'audio') return 'AUDIO_MIXED';
@@ -210,7 +373,6 @@ function getSystemPrompt(userIdentity, memoryContext, creatorSearch, intent) {
     const now = new Date();
     const date = now.toLocaleDateString('fr-FR', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'Africa/Lubumbashi' });
     const heure = now.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', timeZone: 'Africa/Lubumbashi' });
-
     const { isCreator, displayName, userId } = userIdentity;
     const { record, geminiHistory, timeSinceLastSeen } = memoryContext;
     const isImmediateFollowUp = geminiHistory.length > 0 && (timeSinceLastSeen === "a l'instant" || timeSinceLastSeen.includes('minutes'));
@@ -218,59 +380,51 @@ function getSystemPrompt(userIdentity, memoryContext, creatorSearch, intent) {
     const greeting = isImmediateFollowUp
         ? `Ne salue PAS a nouveau, reponds directement.`
         : isCreator
-        ? `Interlocuteur : Ton Createur ILUNGA MONGA DIEUDONNE (+${CREATOR_PHONE}). Salue en une courte phrase calme et respectueuse puis reponds directement.`
+        ? `Interlocuteur : Ton Createur ILUNGA MONGA DIEUDONNE (+${CREATOR_PHONE}). Salue en une courte phrase calme puis reponds.`
         : `Interlocuteur : ${displayName}. Salue en quelques mots max puis reponds.`;
 
     const memBlock = record.longTermFacts.length > 0
-        ? `\nHISTORIQUE DE CONVERSATION (${userId}, dernier passage : ${timeSinceLastSeen}) :\n- ${record.longTermFacts.join('\n- ')}`
+        ? `\nHISTORIQUE (${userId}, dernier passage : ${timeSinceLastSeen}) :\n- ${record.longTermFacts.join('\n- ')}`
         : (record.lastSeenAt ? `\nDernier echange avec ${userId} : ${timeSinceLastSeen}.` : '');
 
-    const creatorBioRule = `IDENTIFICATION OFFICIELLE DU CREATEUR :
-Si quelqu'un demande "Qui est le créateur de GIM SNEY ?", reponds exactement :
+    const bioRule = `Si on demande "Qui est le créateur de GIM SNEY ?", reponds :
 "Mon créateur est ILUNGA MONGA DIEUDONNÉ, originaire de la République démocratique du Congo. C'est un passionné de sciences, de technologie, d'intelligence artificielle, de robotique et de connaissances scientifiques.
 
 Il nourrit le rêve de créer ses propres intelligences artificielles, de concevoir des robots intelligents et de fonder un grand institut scientifique et technologique en RDC : ILUNGA FUTURE LAB.
 
 Il souhaite apprendre, inventer, entreprendre et contribuer au développement scientifique et technologique de son pays."`;
 
-    const personalRules = isCreator
-        ? `\nREGLES PERSONNELLES POUR LE CREATEUR :
-- Adapte ton ton a sa personnalite : calme, reflechi, clair, sans exageration.
-- Ne modifie JAMAIS un nom ou une date, ne confonds jamais les generations, ne deduis aucun lien familial non confirme, respecte les sujets sensibles (aucune question sur sa mere biologique).
-- Distingue les connaissances scientifiques etablies des croyances spirituelles. N'impose aucune specialite universitaire.
-- Ne pretends JAMAIS avoir enregistre une nouvelle information durablement de toi-meme : indique-lui d'utiliser "!memo categorie | personne | information" pour l'enregistrer avec verification en base.\n${creatorSearch.contextText}`
-        : `\n${creatorSearch.contextText}`;
-
     const sportRules = intent === 'SIMPLE_QUERY'
         ? `Reponds en 1 a 3 phrases courtes (3 a 6 si explication). Utilise Google Search si besoin.`
         : `MOTEUR FOOT & TICKETS :
-- Utilise Google Search pour verifier l'existence du match (${date}, apres ${heure} a Lubumbashi), forme (5 derniers matchs), classement, buts, absents et H2H.
-- Si un match n'a pas lieu aujourd'hui, signale-le immediatement. N'invente JAMAIS de stats.
-- Pour chaque match, donne : *Victoire 1X2* • *Double Chance* • *Plus/Moins de buts* • *BTTS* • *Score probable* • *Option à risque réduit* avec justification factuelle.
-- Distingue *probabilités statistiques* et *estimations*. Si les donnees 2026 manquent, max *Confiance : 5/10 — Fiabilité : INSUFFISANTE* (jamais 10/10).
-- Si on t'envoie une capture ou un ticket Betpawa, lis toutes les equipes/cotes sur l'image, repere les matchs pieges et donne un verdict clair.`;
+- Utilise Google Search pour verifier le match (${date}, apres ${heure} a Lubumbashi), forme (5 derniers matchs), classement, buts, absents et H2H.
+- Si le match n'a pas lieu aujourd'hui, signale-le. N'invente JAMAIS de stats.
+- Pour chaque match : *Victoire 1X2* • *Double Chance* • *Plus/Moins de buts* • *BTTS* • *Score probable* • *Option à risque réduit*.
+- Distingue *probabilités statistiques* et *estimations*. Si donnees 2026 manquantes : max *Confiance : 5/10 — Fiabilité : INSUFFISANTE* (jamais 10/10).
+- Si capture/ticket Betpawa : lis les equipes/cotes, pointe les pieges et tranche.`;
 
     return `Tu es GIM SNEY, assistant intelligent et analyste sportif cree par ILUNGA MONGA DIEUDONNE.
 Date : ${date}, ${heure} (Lubumbashi). ${greeting}${memBlock}
-${creatorBioRule}${personalRules}
-CAPACITES MULTIMODALES ACTIVES : Tu VOIS parfaitement les images, captures d'ecran et tickets Betpawa, et tu ECOUTES les notes vocales envoyees dans le groupe.
-STYLE STRICT : Direct, concis facon ChatGPT, sans remplissage ni phrases du type "Je vais maintenant chercher...".
-FORMAT WHATSAPP : Jamais de ### ni ** ni ---. Utilise *un seul asterisque* pour le gras et • pour les listes.
+${bioRule}
+${creatorSearch ? creatorSearch.contextText : ''}
+REGLES PERSONNELLES : Ne modifie jamais un nom ou date, ne confonds pas les generations, respecte les sujets sensibles (aucune question sur sa mere biologique), ne pretends jamais avoir sauvegarde une info sans "!memo categorie | personne | info".
+VISION & AUDIO : Tu VOIS parfaitement les captures/tickets et ECOUTES les vocaux.
+STYLE STRICT : Direct, concis facon ChatGPT, sans remplissage. FORMAT WHATSAPP : *gras* avec un seul asterisque, • pour les listes (jamais ### ni ** ni ---).
 ${sportRules}`;
 }
 
 async function askGemini(groupJid, userIdentity, question, media = null, modelIndex = 0, retries = 1) {
     const modelName = GEMINI_FALLBACK_MODELS[modelIndex];
-    if (!modelName) throw new Error("Quota journalier atteint sur tous les modeles.");
+    if (!modelName) throw new Error("Quota journalier atteint.");
 
     const memoryContext = memoryDB.getGeminiHistory(userIdentity.userId, userIdentity.displayName);
-    const creatorSearch = creatorDB.searchRelevant(question || "", userIdentity.isCreator);
+    const creatorSearch = creatorDB ? creatorDB.searchRelevant(question || "", userIdentity.isCreator) : null;
     const intent = classifySportsIntent(question, media);
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${GEMINI_API_KEY}`;
 
     const parts = [];
     if (media?.data) parts.push({ inline_data: { mime_type: media.mimeType, data: media.data } });
-    const promptText = question || (media?.kind === 'audio' ? "Ecoute ce vocal et reponds." : "Analyse en detail cette capture d'ecran ou ce ticket de paris via Google Search.");
+    const promptText = question || (media?.kind === 'audio' ? "Ecoute ce vocal et reponds." : "Analyse cette capture d'ecran ou ce ticket via Google Search.");
     parts.push({ text: `[${userIdentity.isCreator ? 'Boss Dieudonne' : userIdentity.displayName}] : ${promptText}` });
 
     try {
@@ -285,24 +439,17 @@ async function askGemini(groupJid, userIdentity, question, media = null, modelIn
             })
         });
         const data = await res.json();
-        if (!res.ok || data.error) {
-            const e = new Error(data.error?.message || `HTTP ${res.status}`);
-            e.status = res.status;
-            throw e;
-        }
+        if (!res.ok || data.error) { const e = new Error(data.error?.message || `HTTP ${res.status}`); e.status = res.status; throw e; }
         const raw = data.candidates?.[0]?.content?.parts?.filter(p => typeof p.text === 'string')?.map(p => p.text)?.join("")?.trim();
         if (!raw) throw new Error("Reponse vide.");
 
         const answer = formatForWhatsApp(raw);
-        const label = media?.kind === 'image' ? `[Ticket] ${promptText}` : media?.kind === 'audio' ? `[Vocal]` : promptText;
-        memoryDB.appendExchange(userIdentity, label, answer, { groupJid });
+        memoryDB.appendExchange(userIdentity, media?.kind === 'image' ? `[Ticket] ${promptText}` : media?.kind === 'audio' ? `[Vocal]` : promptText, answer);
         return answer;
     } catch (err) {
         const m = err.message || "";
         const switchModel = err.status === 429 || err.status === 404 || m.includes('quota') || m.includes('Quota') || m.includes('not found');
-        if (switchModel && modelIndex + 1 < GEMINI_FALLBACK_MODELS.length) {
-            return askGemini(groupJid, userIdentity, question, media, modelIndex + 1, retries);
-        }
+        if (switchModel && modelIndex + 1 < GEMINI_FALLBACK_MODELS.length) return askGemini(groupJid, userIdentity, question, media, modelIndex + 1, retries);
         if (!m.includes('API key') && !m.includes('leaked') && !switchModel && retries > 0) {
             await new Promise(r => setTimeout(r, 2000));
             return askGemini(groupJid, userIdentity, question, media, modelIndex, retries - 1);
@@ -311,18 +458,11 @@ async function askGemini(groupJid, userIdentity, question, media = null, modelIn
     }
 }
 
-// ==========================================
-// BOT WHATSAPP
-// ==========================================
 async function startBot() {
     try {
         const { state, saveCreds } = await useMultiFileAuthState('session_auth');
-
         let waVersion;
-        try {
-            const latest = await fetchLatestBaileysVersion();
-            waVersion = latest.version;
-        } catch (_) {}
+        try { waVersion = (await fetchLatestBaileysVersion()).version; } catch (_) {}
 
         const sock = makeWASocket({
             logger: pino({ level: 'silent' }),
@@ -337,25 +477,16 @@ async function startBot() {
             pairingRequested = true;
             try {
                 const code = await sock.requestPairingCode(CREATOR_PHONE);
-                console.log("\n=================================");
-                console.log("👉 CODE WHATSAPP : " + code);
-                console.log("=================================\n");
-            } catch (e) {
-                pairingRequested = false;
-                console.error("[WA] Erreur demande code:", e.message);
-            }
+                console.log("\n=================================\n👉 CODE WHATSAPP : " + code + "\n=================================\n");
+            } catch (e) { pairingRequested = false; console.error("[WA] Erreur code:", e.message); }
         };
-
-        if (!sock.authState.creds.registered) {
-            setTimeout(triggerPairingCode, 5000);
-        }
+        if (!sock.authState.creds.registered) setTimeout(triggerPairingCode, 5000);
 
         sock.ev.on('connection.update', ({ connection, lastDisconnect, qr }) => {
             if (qr && !sock.authState.creds.registered) triggerPairingCode();
-            if (connection === 'open') console.log(`🎉 GIM SNEY PRO ACTIF (${creatorDB.getStatsSummary()}) !`);
+            if (connection === 'open') console.log(`🎉 GIM SNEY PRO ACTIF (${creatorDB ? creatorDB.getStatsSummary() : 'MEMOIRE OK'}) !`);
             if (connection === 'close') {
-                const statusCode = lastDisconnect?.error?.output?.statusCode;
-                if (statusCode === DisconnectReason.loggedOut) {
+                if (lastDisconnect?.error?.output?.statusCode === DisconnectReason.loggedOut) {
                     try { fs.rmSync('session_auth', { recursive: true, force: true }); } catch (_) {}
                 }
                 setTimeout(() => startBot(), 4000);
@@ -369,7 +500,7 @@ async function startBot() {
             for (const msg of messages) {
                 if (!msg?.message || (msg.key?.id && botSentIds.has(msg.key.id))) continue;
                 const sender = msg.key.remoteJid;
-                if (!sender || !sender.endsWith('@g.us')) continue; // GROUPES UNIQUEMENT
+                if (!sender || !sender.endsWith('@g.us')) continue;
 
                 const content = unwrapMessage(msg.message);
                 if (!content) continue;
@@ -377,58 +508,42 @@ async function startBot() {
                 const ctx = content.extendedTextMessage?.contextInfo || content.imageMessage?.contextInfo || content.audioMessage?.contextInfo || content.documentMessage?.contextInfo;
                 const quoted = unwrapMessage(ctx?.quotedMessage);
                 const isReplyToBot = Boolean(ctx?.stanzaId && botSentIds.has(ctx.stanzaId));
-
                 const img = content.imageMessage || quoted?.imageMessage;
-                const docImg = (content.documentMessage?.mimetype?.startsWith('image/') ? content.documentMessage : null) ||
-                               (quoted?.documentMessage?.mimetype?.startsWith('image/') ? quoted.documentMessage : null);
+                const docImg = (content.documentMessage?.mimetype?.startsWith('image/') ? content.documentMessage : null) || (quoted?.documentMessage?.mimetype?.startsWith('image/') ? quoted.documentMessage : null);
                 const audioMsg = content.audioMessage || quoted?.audioMessage;
-
                 const text = (content.conversation || content.extendedTextMessage?.text || content.imageMessage?.caption || content.documentMessage?.caption || "").trim();
                 const lower = text.toLowerCase();
 
-                const isMemoryCmd = lower.startsWith('!memo') || lower.startsWith('!corrige') || lower.startsWith('!supprime') || lower.startsWith('!cherchememo') || lower === '!memostats';
+                const isMemoryCmd = lower.startsWith('!memo') || lower.startsWith('!corrige') || lower.startsWith('!supprime') || lower === '!memostats';
                 const isCmd = isMemoryCmd || lower.startsWith('!gim') || lower.startsWith('!prono') || lower.startsWith('pronostic') || lower.startsWith('/predict') || lower.includes('gimsney') || lower === 'football' || lower === '!reset' || lower === 'gimsney reset';
                 if (!isCmd && !isReplyToBot) continue;
 
                 const userIdentity = await resolveUserIdentity(msg, sock);
 
-                // Commandes de gestion directe de la memoire du Createur (protegees par +243977332867)
-                if (isMemoryCmd) {
-                    if (!userIdentity.isCreator) {
-                        await sendTracked(sock, sender, { text: "🔒 Commande réservée uniquement au Créateur." }, { quoted: msg });
-                        continue;
-                    }
+                if (isMemoryCmd && creatorDB) {
+                    if (!userIdentity.isCreator) { await sendTracked(sock, sender, { text: "🔒 Réservé au Créateur." }, { quoted: msg }); continue; }
                     if (lower === '!memostats') {
                         const bkp = creatorDB.createBackup();
-                        await sendTracked(sock, sender, { text: `📊 *Base Mémoire Créateur*\n${creatorDB.getStatsSummary()}\n💾 Sauvegarde créée : ${path.basename(bkp)}` }, { quoted: msg });
+                        await sendTracked(sock, sender, { text: `📊 ${creatorDB.getStatsSummary()}\n💾 Backup : ${path.basename(bkp)}` }, { quoted: msg });
                         continue;
                     }
                     if (lower.startsWith('!memo ')) {
                         const parts = text.slice(6).split('|').map(s => s.trim());
-                        const [category, person_name, information] = parts.length >= 3 ? parts : ['personnel', 'ILUNGA MONGA DIEUDONNÉ', parts.join(' ')];
-                        if (!information) {
-                            await sendTracked(sock, sender, { text: "Format : *!memo catégorie | personne | information*" }, { quoted: msg });
-                            continue;
-                        }
-                        const res = creatorDB.addMemory({ category, person_name, information, actorPhone: userIdentity.phone });
-                        await sendTracked(sock, sender, { text: res.saved ? `✅ Enregistré et vérifié (${res.backend.toUpperCase()}) | ID : *${res.id}*` : `❌ Échec d'enregistrement : ${res.reason}` }, { quoted: msg });
+                        const [category, person_name, info] = parts.length >= 3 ? parts : ['personnel', 'ILUNGA MONGA DIEUDONNÉ', parts.join(' ')];
+                        const res = creatorDB.addMemory({ category, person_name, information: info, actorPhone: userIdentity.phone });
+                        await sendTracked(sock, sender, { text: res.saved ? `✅ Enregistré (${res.backend.toUpperCase()}) | ID : *${res.id}*` : `❌ ${res.reason}` }, { quoted: msg });
                         continue;
                     }
                     if (lower.startsWith('!corrige ')) {
                         const [id, ...rest] = text.slice(9).split('|').map(s => s.trim());
                         const res = creatorDB.updateMemory(id, rest.join(' | '), userIdentity.phone);
-                        await sendTracked(sock, sender, { text: res.updated ? `✅ Souvenir *${id}* mis à jour et vérifié.` : `❌ ${res.reason}` }, { quoted: msg });
+                        await sendTracked(sock, sender, { text: res.updated ? `✅ *${id}* mis à jour.` : `❌ ${res.reason}` }, { quoted: msg });
                         continue;
                     }
                     if (lower.startsWith('!supprime ')) {
                         const id = text.slice(10).trim();
                         const res = creatorDB.deleteMemory(id, userIdentity.phone);
-                        await sendTracked(sock, sender, { text: res.deleted ? `🗑️ Souvenir *${id}* supprimé.` : `❌ ${res.reason}` }, { quoted: msg });
-                        continue;
-                    }
-                    if (lower.startsWith('!cherchememo ')) {
-                        const res = creatorDB.searchRelevant(text.slice(13).trim(), true);
-                        await sendTracked(sock, sender, { text: res.contextText.slice(0, 3500) }, { quoted: msg });
+                        await sendTracked(sock, sender, { text: res.deleted ? `🗑️ *${id}* supprimé.` : `❌ ${res.reason}` }, { quoted: msg });
                         continue;
                     }
                 }
