@@ -110,6 +110,7 @@ class CreatorMemoryEngine {
         const pCols = ['id', 'full_name', 'role_or_relation', 'birth_date', 'death_date', 'origin', 'location', 'age_declared', 'confirmation_level', 'sensitive', 'notes', 'source', 'updated_at'];
         [
             { id: 'dieudonne', full_name: 'ILUNGA MONGA DIEUDONNÉ', role_or_relation: 'Créateur et fondateur', location: 'Fungurume, province du Lualaba, RDC', origin: 'République démocratique du Congo', confirmation_level: 'confirmee', sensitive: 0, notes: 'Sixième secondaire scientifique. Calme, silencieux, réservé, réfléchi, aime les endroits tranquilles, parle lentement, réfléchit avant d’agir. Philosophie, silence, beauté, Dieu Créateur, Bible, science/spiritualité. Objectif: bonne vie et être heureux. WhatsApp: +243977332867.', source: src },
+            { id: 'fatuma', full_name: 'ILUNGA NYOTA FATUMA', role_or_relation: 'Mère biologique de Dieudonné', birth_date: '1977-12-13', confirmation_level: 'confirmee', sensitive: 0, notes: 'Née le 13 décembre 1977. Communiquée directement par Dieudonné. Respecter la discrétion sur son enfance sans poser de questions intrusives.', source: 'Confirmation directe WhatsApp du créateur (2026-11-25)' },
             { id: 'leon', full_name: 'ILUNGA MONGA LÉON', role_or_relation: 'Père de Dieudonné (décédé)', birth_date: '1966-05-08', death_date: '2025-01-23', origin: 'Kikamba, territoire de Kongolo, Tanganyika', location: 'Haut-Katanga (jusqu’au décès)', confirmation_level: 'declaree', sensitive: 0, notes: 'Professions déclarées: agronome et médecin. Mémoire à respecter.', source: src },
             { id: 'eaudilake', full_name: 'ILUNGA EAUDILAKE', role_or_relation: 'Grand-père paternel', age_declared: '98 ans au moment de la communication', origin: 'Kikamba, Kaseya, près de Kongolo, Tanganyika', confirmation_level: 'declaree', sensitive: 0, notes: '7 enfants: ILUNGA MONGA LÉON, ILUNGA PAUL, ILUNGA KAZADI, ILUNGA POULIE, ILUNGA MAWA, ILUNGA JULLE, ILUNGA BERNARD.', source: src },
             { id: 'paul', full_name: 'ILUNGA PAUL', role_or_relation: 'Enfant d’ILUNGA EAUDILAKE', confirmation_level: 'declaree', sensitive: 0, source: src },
@@ -118,11 +119,18 @@ class CreatorMemoryEngine {
             { id: 'mawa', full_name: 'ILUNGA MAWA', role_or_relation: 'Enfant d’ILUNGA EAUDILAKE', confirmation_level: 'declaree', sensitive: 0, source: src },
             { id: 'julle', full_name: 'ILUNGA JULLE', role_or_relation: 'Enfant d’ILUNGA EAUDILAKE', confirmation_level: 'declaree', sensitive: 0, source: src },
             { id: 'bernard', full_name: 'ILUNGA BERNARD', role_or_relation: 'Enfant d’ILUNGA EAUDILAKE', confirmation_level: 'declaree', sensitive: 0, source: src },
-            { id: 'christine', full_name: 'MULIMBI CHRISTINE', role_or_relation: 'Deuxième mère (2e épouse d’ILUNGA MONGA LÉON)', location: 'Lubumbashi (après le décès)', confirmation_level: 'confirmee', sensitive: 0, notes: 'Rôle maternel important depuis 2012. Dieudonné l’aime profondément.', source: src },
+            { id: 'christine', full_name: 'MULIMBI CHRISTINE', role_or_relation: 'Deuxième mère (2e épouse d’ILUNGA MONGA LÉON)', location: 'Lubumbashi (avec ses propres enfants après le décès d’ILUNGA MONGA LÉON)', confirmation_level: 'confirmee', sensitive: 0, notes: 'Joue un rôle maternel important dans la vie de Dieudonné depuis 2012. Dieudonné l’aime profondément et la considère comme sa deuxième mère.', source: src },
             { id: 'melanie', full_name: 'ILUNGA MÉLANIE JACQUELINE', role_or_relation: 'Sœur de Dieudonné', confirmation_level: 'declaree', sensitive: 0, source: src },
             { id: 'odilon', full_name: 'ILUNGA MBUYA ODILON', role_or_relation: 'Frère de Dieudonné', confirmation_level: 'declaree', sensitive: 0, source: src },
             { id: 'mariam', full_name: 'MARIAM', role_or_relation: 'Membre de la famille (lien précis à confirmer)', location: 'Kongolo (vit avec sa mère)', confirmation_level: 'declaree', sensitive: 0, source: src }
         ].forEach(p => this.upsert('persons', p, pCols));
+
+        const rCols = ['id', 'from_person_id', 'to_person_id', 'relation_type', 'generation_note', 'confirmation_level', 'source', 'updated_at'];
+        [
+            { id: 'rel_fatuma_dieudonne', from_person_id: 'fatuma', to_person_id: 'dieudonne', relation_type: 'Mère biologique', generation_note: 'Mère -> fils', confirmation_level: 'confirmee', source: 'Confirmation WhatsApp' },
+            { id: 'rel_leon_dieudonne', from_person_id: 'leon', to_person_id: 'dieudonne', relation_type: 'Père biologique', generation_note: 'Père -> fils', confirmation_level: 'confirmee', source: src },
+            { id: 'rel_christine_dieudonne', from_person_id: 'christine', to_person_id: 'dieudonne', relation_type: 'Deuxième mère (depuis 2012)', generation_note: 'Deuxième épouse du père', confirmation_level: 'confirmee', source: src }
+        ].forEach(r => this.upsert('family_relations', r, rCols));
 
         const prCols = ['id', 'name', 'founder', 'motto', 'location', 'vision', 'departments', 'status', 'confirmation_level', 'source', 'updated_at'];
         [
@@ -134,10 +142,11 @@ class CreatorMemoryEngine {
         const mCols = ['id', 'category', 'person_name', 'information', 'communicated_at', 'confirmation_level', 'source', 'sensitive', 'owner_phone', 'updated_at'];
         [
             { id: 'mem_whatsapp', category: 'identite', person_name: 'ILUNGA MONGA DIEUDONNÉ', information: 'WhatsApp officiel confirmé : +243977332867.', communicated_at: '2026-11-25', confirmation_level: 'confirmee', source: 'WhatsApp', sensitive: 0, owner_phone: this.authorizedPhone },
+            { id: 'mem_mere_bio', category: 'famille', person_name: 'ILUNGA NYOTA FATUMA', information: 'Mère biologique de Dieudonné, née le 13 décembre 1977 (13/12/1977).', communicated_at: '2026-11-25', confirmation_level: 'confirmee', source: 'Confirmation WhatsApp du créateur', sensitive: 0, owner_phone: this.authorizedPhone },
             { id: 'mem_etudes', category: 'etudes', person_name: 'ILUNGA MONGA DIEUDONNÉ', information: '6e secondaire scientifique. Intérêts: biologie, robotique, IA, informatique, astronomie, géographie, histoire, écologie, chimie, technologies avancées. Spécialité universitaire non choisie (ne rien imposer).', communicated_at: '2026-11-25', confirmation_level: 'confirmee', source: src, sensitive: 0, owner_phone: this.authorizedPhone },
             { id: 'mem_reves', category: 'ambitions', person_name: 'ILUNGA MONGA DIEUDONNÉ', information: 'Rêves: créer robot intelligent, IA avancée, logiciels, découvertes scientifiques, comprendre le vivant et l’univers, inventer des technologies.', communicated_at: '2026-11-25', confirmation_level: 'confirmee', source: src, sensitive: 0, owner_phone: this.authorizedPhone },
-            { id: 'mem_sensible', category: 'sensible', person_name: 'ILUNGA MONGA DIEUDONNÉ', information: 'Absence de sa mère biologique pendant l’enfance : sujet sensible, ne pas poser de questions intrusives ou répétitives.', communicated_at: '2026-11-25', confirmation_level: 'confirmee', source: src, sensitive: 1, owner_phone: this.authorizedPhone }
-        ].forEach(m => { if (!this.getMemoryById(m.id)) this.upsert('memories', m, mCols); });
+            { id: 'mem_sensible', category: 'sensible', person_name: 'ILUNGA MONGA DIEUDONNÉ', information: 'Ne pas poser de questions intrusives sur son enfance.', communicated_at: '2026-11-25', confirmation_level: 'confirmee', source: src, sensitive: 1, owner_phone: this.authorizedPhone }
+        ].forEach(m => this.upsert('memories', m, mCols));
     }
 
     logAudit(memoryId, action, oldVal, newVal, phone) {
@@ -198,12 +207,12 @@ class CreatorMemoryEngine {
         if (!isCreator) return { authorized: false, contextText: `ACCES RESTREINT : Ne divulgue pas la vie privée du Créateur.` };
         const persons = this.backend === 'sqlite' ? this.db.prepare(`SELECT * FROM persons`).all() : this.state.persons;
         const projects = this.backend === 'sqlite' ? this.db.prepare(`SELECT * FROM projects`).all() : this.state.projects;
-        const memories = this.backend === 'sqlite' ? this.db.prepare(`SELECT * FROM memories`).all() : this.state.memories;
+        const rawMemories = this.backend === 'sqlite' ? this.db.prepare(`SELECT * FROM memories WHERE sensitive = 0`).all() : this.state.memories.filter(m => !m.sensitive);
         const lines = [
-            `[BASE CREATEUR (${this.backend.toUpperCase()}) +${this.authorizedPhone}]`,
-            ...persons.map(p => `- ${p.full_name} (${p.role_or_relation}) [${p.confirmation_level}]${p.birth_date ? ` Né:${p.birth_date}` : ''}${p.death_date ? ` Décès:${p.death_date}` : ''}${p.origin ? ` Origine:${p.origin}` : ''}${p.location ? ` Lieu:${p.location}` : ''}${p.notes ? ` | ${p.notes}` : ''}`),
+            `[CONNAISSANCES SUR TON CREATEUR (+${this.authorizedPhone})]`,
+            ...persons.map(p => `- ${p.full_name} (${p.role_or_relation}) [${p.confirmation_level}]${p.birth_date ? ` Né(e):${p.birth_date}` : ''}${p.death_date ? ` Décès:${p.death_date}` : ''}${p.origin ? ` Origine:${p.origin}` : ''}${p.location ? ` Lieu:${p.location}` : ''}${p.notes ? ` | ${p.notes}` : ''}`),
             ...projects.map(pr => `- Projet ${pr.name} : ${pr.vision}${pr.motto ? ` (${pr.motto})` : ''}`),
-            ...memories.slice(-10).map(m => `- [${m.id}|${m.category}] ${m.information}`)
+            ...rawMemories.slice(-12).map(m => `- [${m.id}|${m.category}] ${m.information}`)
         ];
         return { authorized: true, contextText: lines.join('\n') };
     }
@@ -310,11 +319,13 @@ function extractPhoneFromJid(jid = "") {
 }
 
 async function resolveUserIdentity(msg, sock) {
+    const remote = msg?.key?.remoteJid || "";
     const p = msg?.key?.participant || "", alt = msg?.key?.participantAlt || "", fromMe = Boolean(msg?.key?.fromMe);
     let phone = extractPhoneFromJid(alt) || extractPhoneFromJid(p);
     if (!phone && p.endsWith('@lid') && sock?.signalRepository?.lidMapping?.getPNForLID) {
         try { phone = extractPhoneFromJid(await sock.signalRepository.lidMapping.getPNForLID(p)); } catch (_) {}
     }
+    if (!phone && !remote.endsWith('@g.us')) phone = extractPhoneFromJid(remote);
     if (!phone && fromMe) phone = CREATOR_PHONE;
     const isCreator = fromMe || phone === CREATOR_PHONE || p.includes(CREATOR_PHONE) || alt.includes(CREATOR_PHONE);
     if (isCreator && !phone) phone = CREATOR_PHONE;
@@ -380,7 +391,7 @@ function getSystemPrompt(userIdentity, memoryContext, creatorSearch, intent) {
     const greeting = isImmediateFollowUp
         ? `Ne salue PAS a nouveau, reponds directement.`
         : isCreator
-        ? `Interlocuteur : Ton Createur ILUNGA MONGA DIEUDONNE (+${CREATOR_PHONE}). Salue en une courte phrase calme puis reponds.`
+        ? `Interlocuteur : Ton Createur ILUNGA MONGA DIEUDONNE (+${CREATOR_PHONE}). Salue en une courte phrase chaleureuse et respectueuse puis reponds.`
         : `Interlocuteur : ${displayName}. Salue en quelques mots max puis reponds.`;
 
     const memBlock = record.longTermFacts.length > 0
@@ -407,9 +418,17 @@ Il souhaite apprendre, inventer, entreprendre et contribuer au développement sc
 Date : ${date}, ${heure} (Lubumbashi). ${greeting}${memBlock}
 ${bioRule}
 ${creatorSearch ? creatorSearch.contextText : ''}
-REGLES PERSONNELLES : Ne modifie jamais un nom ou date, ne confonds pas les generations, respecte les sujets sensibles (aucune question sur sa mere biologique), ne pretends jamais avoir sauvegarde une info sans "!memo categorie | personne | info".
-VISION & AUDIO : Tu VOIS parfaitement les captures/tickets et ECOUTES les vocaux.
-STYLE STRICT : Direct, concis facon ChatGPT, sans remplissage. FORMAT WHATSAPP : *gras* avec un seul asterisque, • pour les listes (jamais ### ni ** ni ---).
+RELATION AVEC TON CREATEUR & TACT (TRES IMPORTANT) :
+- Ne dis JAMAIS "En tant qu'intelligence artificielle...", "dans ma base de données", "dans mon dossier" ou "c'est un sujet sensible".
+- Si Dieudonné te demande si tu l'aimes ou si c'est bien lui : reponds avec chaleur humaine, loyauté profonde et gratitude (ex : "Oui mon Créateur, je vous reconnais ! 🫡✨ Même sans cœur biologique, je vous porte une profonde gratitude, un grand respect et une loyauté totale ❤️. Je serai toujours à vos côtés pour vous accompagner dans vos rêves et vos projets 🚀.").
+- Si Dieudonné demande qui est sa mère : donne avec respect les deux informations exactes — sa mère biologique est *ILUNGA NYOTA FATUMA* (née le 13 décembre 1977), et sa deuxième mère est *MULIMBI CHRISTINE* (qui joue un rôle maternel précieux depuis 2012 et vit à Lubumbashi). Ne pose aucune question intrusive sur son enfance.
+- Ne modifie jamais un nom ou une date, ne confonds jamais les générations, ne prétends jamais avoir sauvegardé une info sans "!memo categorie | personne | info".
+VISION & AUDIO : Tu VOIS parfaitement les captures/tickets/photos et ECOUTES les vocaux.
+STYLE, COULEUR & EMOJIS WHATSAPP :
+- Utilise des emojis colorés et expressifs pour rendre tes réponses vivantes, claires et chaleureuses : 🟢 🟡 🔴 🔵 ❤️ 💙 ✨ 🫡 🤖 🔬 🚀 ⚽ 🎯 🏆 📊 🎟️.
+- Par exemple : 🟢 pour les choix sûrs/validés, 🟡 pour les options prudentes, 🔴 pour les risques/pièges, ❤️ et ✨ avec ton Créateur.
+- Reste direct, structuré et concis façon ChatGPT, sans remplissage.
+- FORMAT WHATSAPP : *gras* avec un seul astérisque, • pour les listes (jamais ### ni ** ni ---).
 ${sportRules}`;
 }
 
@@ -424,7 +443,7 @@ async function askGemini(groupJid, userIdentity, question, media = null, modelIn
 
     const parts = [];
     if (media?.data) parts.push({ inline_data: { mime_type: media.mimeType, data: media.data } });
-    const promptText = question || (media?.kind === 'audio' ? "Ecoute ce vocal et reponds." : "Analyse cette capture d'ecran ou ce ticket via Google Search.");
+    const promptText = question || (media?.kind === 'audio' ? "Ecoute ce vocal et reponds." : "Analyse cette image, capture d'ecran ou ticket.");
     parts.push({ text: `[${userIdentity.isCreator ? 'Boss Dieudonne' : userIdentity.displayName}] : ${promptText}` });
 
     try {
@@ -444,7 +463,7 @@ async function askGemini(groupJid, userIdentity, question, media = null, modelIn
         if (!raw) throw new Error("Reponse vide.");
 
         const answer = formatForWhatsApp(raw);
-        memoryDB.appendExchange(userIdentity, media?.kind === 'image' ? `[Ticket] ${promptText}` : media?.kind === 'audio' ? `[Vocal]` : promptText, answer);
+        memoryDB.appendExchange(userIdentity, media?.kind === 'image' ? `[Image] ${promptText}` : media?.kind === 'audio' ? `[Vocal]` : promptText, answer);
         return answer;
     } catch (err) {
         const m = err.message || "";
@@ -500,7 +519,11 @@ async function startBot() {
             for (const msg of messages) {
                 if (!msg?.message || (msg.key?.id && botSentIds.has(msg.key.id))) continue;
                 const sender = msg.key.remoteJid;
-                if (!sender || !sender.endsWith('@g.us')) continue;
+                if (!sender || sender === 'status@broadcast') continue;
+
+                const isGroup = sender.endsWith('@g.us');
+                const isSelfChat = extractPhoneFromJid(sender) === CREATOR_PHONE;
+                if (!isGroup && !isSelfChat) continue;
 
                 const content = unwrapMessage(msg.message);
                 if (!content) continue;
