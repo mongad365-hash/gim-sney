@@ -8,12 +8,13 @@ let DatabaseSync = null;
 try { ({ DatabaseSync } = require('node:sqlite')); } catch (_) { DatabaseSync = null; }
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AQ.Ab8RN6KeFgt7wruY4XiA-_lb7u5SjVftPUIq6kQTbA3VPv891A";
-const SERPER_API_KEY = process.env.SERPER_API_KEY || ""; // Optionnel : Google Images sur serper.dev
+const SERPER_API_KEY = process.env.SERPER_API_KEY || "";
 const GEMINI_FALLBACK_MODELS = [...new Set([process.env.GEMINI_MODEL || "gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.1-flash-lite"])];
 const CREATOR_PHONE = "243977332867";
 const SELF_URL = "https://gim-sney.onrender.com";
 const MEMORY_DB_DIR = process.env.MEMORY_DIR || path.join(__dirname, 'gim_memory_db');
 const botSentIds = new Set();
+const lastUserImages = new Map(); // Memoire visuelle de la derniere image par utilisateur
 
 process.on('uncaughtException', (err) => console.error('[ERREUR]:', err.message));
 process.on('unhandledRejection', (err) => console.error('[PROMESSE]:', err.message));
@@ -24,6 +25,19 @@ http.createServer((req, res) => {
     res.end('GIM SNEY IA PRO est 100% active et en ligne 24h/24 !\nCreee par ILUNGA MONGA DIEUDONNE.');
 }).listen(PORT, () => console.log(`[HTTP] Serveur actif sur le port ${PORT}`));
 setInterval(() => { fetch(SELF_URL).catch(() => {}); }, 10 * 60 * 1000);
+
+function rememberUserImage(userId, mimeType, buffer, label = '') {
+    if (!userId || !buffer) return;
+    lastUserImages.set(userId, { kind: 'image', mimeType, data: buffer.toString('base64'), label, ts: Date.now() });
+    if (lastUserImages.size > 100) lastUserImages.delete(lastUserImages.keys().next().value);
+}
+
+function getRecentUserImage(userId) {
+    const item = lastUserImages.get(userId);
+    if (!item) return null;
+    if (Date.now() - item.ts > 30 * 60 * 1000) { lastUserImages.delete(userId); return null; }
+    return item;
+}
 
 // ==========================================
 // BASE PERSONNELLE DU CREATEUR (SQLITE / JSON)
@@ -308,7 +322,6 @@ async function fetchBestWebImage(query) {
     if (!query || !query.trim()) return null;
     const seen = new Set();
 
-    // 1. Serper Google Images (si SERPER_API_KEY configuree)
     if (SERPER_API_KEY) {
         try {
             const res = await fetch('https://google.serper.dev/images', {
@@ -322,12 +335,11 @@ async function fetchBestWebImage(query) {
                 const urls = [];
                 for (const it of (data.images || [])) { if (it.imageUrl) urls.push(it.imageUrl); if (it.thumbnailUrl) urls.push(it.thumbnailUrl); }
                 const found = await tryImageUrls(urls, seen);
-                if (found) { console.log(`[IMAGE SERPER] "${query}"`); return found; }
+                if (found) return found;
             }
         } catch (_) {}
     }
 
-    // 2. Wikipedia FR & EN (sans cle API, multi-domaines)
     for (const lang of ['fr', 'en']) {
         try {
             const u = `https://${lang}.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(query)}&gsrlimit=5&prop=pageimages&piprop=thumbnail|original&pithumbsize=1000&format=json&origin=*`;
@@ -338,12 +350,11 @@ async function fetchBestWebImage(query) {
                 const urls = [];
                 for (const p of pages) { if (p.thumbnail?.source) urls.push(p.thumbnail.source); if (p.original?.source) urls.push(p.original.source); }
                 const found = await tryImageUrls(urls, seen);
-                if (found) { console.log(`[IMAGE WIKI-${lang.toUpperCase()}] "${query}"`); return found; }
+                if (found) return found;
             }
         } catch (_) {}
     }
 
-    // 3. Wikimedia Commons (photos, logos, illustrations)
     try {
         const u = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrnamespace=6&gsrsearch=${encodeURIComponent(query)}&gsrlimit=6&prop=imageinfo&iiprop=url|mime&iiurlwidth=1000&format=json&origin=*`;
         const res = await fetch(u, { headers: { 'User-Agent': 'GIMSneyBot/2.0' }, signal: AbortSignal.timeout(7000) });
@@ -357,7 +368,7 @@ async function fetchBestWebImage(query) {
                 else if (info?.url && /image\/(jpeg|png|webp|gif)/i.test(info.mime || '')) urls.push(info.url);
             }
             const found = await tryImageUrls(urls, seen);
-            if (found) { console.log(`[IMAGE COMMONS] "${query}"`); return found; }
+            if (found) return found;
         }
     } catch (_) {}
 
@@ -467,11 +478,11 @@ ${bioRule}
 ${creatorSearch ? creatorSearch.contextText : ''}
 RAISONNEMENT : 1) Comprends l'intention reelle et le contexte. 2) Raisonne logiquement etape par etape en silence. 3) Distingue *faits vérifiés*, *hypothèses/probabilités* et *croyances*. Reconnais tes incertitudes/erreurs sans inventer. 4) Adapte ton ton et ne repete pas les infos deja donnees.
 TACT CREATEUR : Ne dis JAMAIS "En tant qu'intelligence artificielle...", "dans ma base de données", "dans mon dossier" ou "c'est un sujet sensible". Si Dieudonné demande si tu l'aimes : reponds avec chaleur, loyauté et gratitude ❤️🚀. Sa mère biologique est *ILUNGA NYOTA FATUMA* (13/12/1977) et sa deuxième mère est *MULIMBI CHRISTINE* (depuis 2012, à Lubumbashi) — aucune question intrusive sur son enfance. Ne pretends jamais sauvegarder sans "!memo categorie | personne | info".
-VISION/AUDIO : Tu VOIS photos/captures/tickets et ECOUTES les vocaux.
+VISION, MEMOIRE VISUELLE & AUDIO : Tu VOIS parfaitement les photos/captures/tickets (y compris la derniere image envoyee ou recue en memoire) et ECOUTES les vocaux. Ne dis JAMAIS que tu ne peux pas voir les captures d'ecran ni que tu n'as pas de memoire visuelle.
 RECHERCHE ET ENVOI D'IMAGES INTERNET (UNIVERSEL) :
-- Tu es connecte a un moteur d'images universel (tous sujets sans exception : personnes, animaux, nature, sciences, astronomie, histoire, geographie, monuments, objets, vehicules, sports, logos, illustrations...).
-- Quand l'utilisateur demande une image (meme avec des fautes d'orthographe) OU quand une image reelle illustre utilement ta reponse (ex: planete, animal, monument, personnalite, concept visuel), ajoute tout a la fin : [IMAGE_SEARCH: requete claire et orthographice corrigee].
-- N'invente jamais d'URL d'image dans ton texte et ne dis jamais que tu ne peux pas envoyer d'images.
+- Tu es connecte a un moteur d'images universel (tous sujets).
+- Si l'utilisateur demande une image OU si une image illustre utilement ta reponse, ajoute a la fin : [IMAGE_SEARCH: requete claire corrigee].
+- Si une image de la conversation est deja jointe pour analyse, reponds dessus directement SANS lancer [IMAGE_SEARCH: ...] sauf demande d'une nouvelle image.
 STYLE WHATSAPP : Emojis colorés (🟢 🟡 🔴 🔵 ❤️ 💙 ✨ 🫡 🤖 🔬 🚀 ⚽ 🎯 🏆 📊 🎟️), *gras* avec un seul astérisque, • pour les listes (jamais ### ni ** ni ---).
 ${domainRules}`;
 }
@@ -496,8 +507,9 @@ async function askGemini(groupJid, userIdentity, question, media = null, modelIn
 
     const parts = [];
     if (media?.data) parts.push({ inline_data: { mime_type: media.mimeType, data: media.data } });
+    const imgPrefix = media?.fromMemory ? `[Image récente en mémoire : ${media.label || 'image précédente'}] ` : '';
     const promptText = question || (media?.kind === 'audio' ? "Ecoute ce vocal et reponds." : "Analyse cette image, capture ou ticket.");
-    parts.push({ text: `[${userIdentity.isCreator ? 'Boss Dieudonne' : userIdentity.displayName}] : ${promptText}` });
+    parts.push({ text: `[${userIdentity.isCreator ? 'Boss Dieudonne' : userIdentity.displayName}] : ${imgPrefix}${promptText}` });
 
     try {
         const res = await fetch(url, {
@@ -522,9 +534,11 @@ async function askGemini(groupJid, userIdentity, question, media = null, modelIn
         let imageResult = null;
         if (imageQuery) {
             imageResult = await fetchBestWebImage(imageQuery);
+            if (imageResult) rememberUserImage(userIdentity.userId, imageResult.mimeType, imageResult.buffer, imageQuery);
         }
 
-        memoryDB.appendExchange(userIdentity, media?.kind === 'image' ? `[Image] ${promptText}` : media?.kind === 'audio' ? `[Vocal]` : promptText, answer, analysis.intent);
+        const savedReply = imageResult ? `${answer}\n[Image envoyée : ${imageQuery}]` : answer;
+        memoryDB.appendExchange(userIdentity, media?.kind === 'image' ? `[Image] ${promptText}` : media?.kind === 'audio' ? `[Vocal]` : promptText, savedReply, analysis.intent);
         return { text: answer, image: imageResult };
     } catch (err) {
         const m = err.message || "";
@@ -600,21 +614,39 @@ async function startBot() {
                     if (lower.startsWith('!corrige ')) { const [id, ...rest] = text.slice(9).split('|').map(s => s.trim()); const r = creatorDB.updateMemory(id, rest.join(' | '), userIdentity.phone); await sendTracked(sock, sender, { text: r.updated ? `✅ *${id}* mis à jour.` : `❌ ${r.reason}` }, { quoted: msg }); continue; }
                     if (lower.startsWith('!supprime ')) { const id = text.slice(10).trim(); const r = creatorDB.deleteMemory(id, userIdentity.phone); await sendTracked(sock, sender, { text: r.deleted ? `🗑️ *${id}* supprimé.` : `❌ ${r.reason}` }, { quoted: msg }); continue; }
                 }
-                if (lower === '!reset' || lower === 'gimsney reset') { memoryDB.clearUserMemory(userIdentity.userId); await sendTracked(sock, sender, { text: `🧹 Mémoire réinitialisée, ${userIdentity.displayName} ! ⚽` }, { quoted: msg }); continue; }
+                if (lower === '!reset' || lower === 'gimsney reset') {
+                    memoryDB.clearUserMemory(userIdentity.userId);
+                    lastUserImages.delete(userIdentity.userId);
+                    await sendTracked(sock, sender, { text: `🧹 Mémoire réinitialisée, ${userIdentity.displayName} ! ⚽` }, { quoted: msg });
+                    continue;
+                }
+
+                const question = text.replace(/^(!gim|!prono|\/predict|pronostic|gimsney)\s*/i, '').trim();
 
                 let media = null;
                 const targetImg = img || docImg;
-                if (targetImg) { const buf = await getMediaBuffer(targetImg, img ? 'image' : 'document'); if (buf) media = { kind: 'image', mimeType: (targetImg.mimetype || 'image/jpeg').split(';')[0].trim(), data: buf.toString('base64') }; }
-                else if (audioMsg) { const buf = await getMediaBuffer(audioMsg, 'audio'); if (buf) media = { kind: 'audio', mimeType: (audioMsg.mimetype || 'audio/ogg').split(';')[0].trim(), data: buf.toString('base64') }; }
+                if (targetImg) {
+                    const buf = await getMediaBuffer(targetImg, img ? 'image' : 'document');
+                    if (buf) {
+                        const mime = (targetImg.mimetype || 'image/jpeg').split(';')[0].trim();
+                        rememberUserImage(userIdentity.userId, mime, buf, 'image utilisateur');
+                        media = { kind: 'image', mimeType: mime, data: buf.toString('base64') };
+                    }
+                } else if (audioMsg) {
+                    const buf = await getMediaBuffer(audioMsg, 'audio');
+                    if (buf) media = { kind: 'audio', mimeType: (audioMsg.mimetype || 'audio/ogg').split(';')[0].trim(), data: buf.toString('base64') };
+                } else if (/\b(cette (capture|image|photo|foto)|l'image|la photo|la capture|que tu m'a|tu as envoy|dessus|la-dessus|là-dessus|sur la photo|sur l'image)\b/i.test(question)) {
+                    const recentImg = getRecentUserImage(userIdentity.userId);
+                    if (recentImg) media = { kind: 'image', mimeType: recentImg.mimeType, data: recentImg.data, fromMemory: true, label: recentImg.label };
+                }
 
-                const question = text.replace(/^(!gim|!prono|\/predict|pronostic|gimsney)\s*/i, '').trim() || (media ? "" : "Cherche les vrais matchs d'aujourd'hui et propose une analyse complete avec pronostics.");
+                const finalQuestion = question || (media ? "" : "Cherche les vrais matchs d'aujourd'hui et propose une analyse complete avec pronostics.");
                 try {
                     await sock.sendPresenceUpdate('composing', sender);
-                    const result = await askGemini(sender, userIdentity, question, media);
+                    const result = await askGemini(sender, userIdentity, finalQuestion, media);
                     if (result.image?.buffer) {
-                        if (result.text.length <= 950) {
-                            await sendTracked(sock, sender, { image: result.image.buffer, mimetype: result.image.mimeType, caption: result.text }, { quoted: msg });
-                        } else {
+                        if (result.text.length <= 950) await sendTracked(sock, sender, { image: result.image.buffer, mimetype: result.image.mimeType, caption: result.text }, { quoted: msg });
+                        else {
                             await sendTracked(sock, sender, { image: result.image.buffer, mimetype: result.image.mimeType }, { quoted: msg });
                             await sendTracked(sock, sender, { text: result.text }, { quoted: msg });
                         }
