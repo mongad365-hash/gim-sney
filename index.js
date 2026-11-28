@@ -7,6 +7,12 @@ const path = require('path');
 let DatabaseSync = null;
 try { ({ DatabaseSync } = require('node:sqlite')); } catch (_) { DatabaseSync = null; }
 
+let JimpClass = null;
+try {
+    const jimpMod = require('jimp');
+    JimpClass = jimpMod.Jimp || jimpMod.default || jimpMod;
+} catch (_) { JimpClass = null; }
+
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AQ.Ab8RN6KeFgt7wruY4XiA-_lb7u5SjVftPUIq6kQTbA3VPv891A";
 const SERPER_API_KEY = process.env.SERPER_API_KEY || "";
 const GEMINI_FALLBACK_MODELS = [...new Set([process.env.GEMINI_MODEL || "gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.1-flash-lite"])];
@@ -14,7 +20,7 @@ const CREATOR_PHONE = "243977332867";
 const SELF_URL = "https://gim-sney.onrender.com";
 const MEMORY_DB_DIR = process.env.MEMORY_DIR || path.join(__dirname, 'gim_memory_db');
 const botSentIds = new Set();
-const lastUserImages = new Map(); // Memoire visuelle de la derniere image par utilisateur
+const lastUserImages = new Map();
 
 process.on('uncaughtException', (err) => console.error('[ERREUR]:', err.message));
 process.on('unhandledRejection', (err) => console.error('[PROMESSE]:', err.message));
@@ -23,7 +29,7 @@ const PORT = process.env.PORT || 10000;
 http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
     res.end('GIM SNEY IA PRO est 100% active et en ligne 24h/24 !\nCreee par ILUNGA MONGA DIEUDONNE.');
-}).listen(PORT, () => console.log(`[HTTP] Serveur actif sur le port ${PORT}`));
+}).listen(PORT, () => console.log(`[HTTP] Serveur actif sur le port ${PORT} | Jimp=${Boolean(JimpClass)}`));
 setInterval(() => { fetch(SELF_URL).catch(() => {}); }, 10 * 60 * 1000);
 
 function rememberUserImage(userId, mimeType, buffer, label = '') {
@@ -138,7 +144,7 @@ class CreatorMemoryEngine {
         const prCols = ['id', 'name', 'founder', 'motto', 'location', 'vision', 'departments', 'status', 'confirmation_level', 'source', 'updated_at'];
         [
             { id: 'proj_future_lab', name: 'ILUNGA FUTURE LAB', founder: 'ILUNGA MONGA DIEUDONNÉ', motto: 'THE FUTURE BEGINS WITH SCIENCE', location: 'RDC — montagne forêt congolaise', vision: 'Immense laboratoire futuriste inspiré de Kaal (Krrish 3).', departments: 'IA, Chimie, Informatique, Biologie, Médecine/Biotech, Astronomie/Espace, Énergie/Tech avancées', status: 'Rêve long terme', confirmation_level: 'confirmee', source: src },
-            { id: 'proj_gim_sney', name: 'GIM SNEY', founder: 'ILUNGA MONGA DIEUDONNÉ', location: 'WhatsApp', vision: 'Assistant intelligent (sport, sciences, recherche, PDF/photos, recherche d’images, mémoire persistante).', departments: 'Sport, IA, Vision, Mémoire', status: 'Actif', confirmation_level: 'confirmee', source: src },
+            { id: 'proj_gim_sney', name: 'GIM SNEY', founder: 'ILUNGA MONGA DIEUDONNÉ', location: 'WhatsApp', vision: 'Assistant intelligent (sport, sciences, recherche, PDF/photos, recherche/annotation d’images, mémoire persistante).', departments: 'Sport, IA, Vision, Mémoire', status: 'Actif', confirmation_level: 'confirmee', source: src },
             { id: 'proj_jarvis', name: 'J.A.R.V.I.S. AI Business Hub RDC', founder: 'ILUNGA MONGA DIEUDONNÉ', location: 'RDC', vision: 'Assistant personnel intelligent et plateforme technologique.', departments: 'IA, Automatisation', status: 'En développement', confirmation_level: 'confirmee', source: src }
         ].forEach(pr => this.upsert('projects', pr, prCols));
 
@@ -286,7 +292,7 @@ let creatorDB = null;
 try { creatorDB = new CreatorMemoryEngine(); } catch (err) { console.error('[CREATOR_DB ERREUR]:', err.message); }
 
 // ==========================================
-// MOTEUR UNIVERSEL DE RECHERCHE D'IMAGES
+// RECHERCHE & ANNOTATION AUTOMATIQUE D'IMAGES
 // ==========================================
 function isValidImageBuffer(buf) {
     if (!buf || buf.length < 1500 || buf.length > 15 * 1024 * 1024) return null;
@@ -375,6 +381,102 @@ async function fetchBestWebImage(query) {
     return null;
 }
 
+function parseAnnotateSpec(specStr = "") {
+    const get = (k, def) => { const m = specStr.match(new RegExp(`${k}\\s*=\\s*([^,\\]\\s]+)`, 'i')); return m ? m[1].trim() : def; };
+    const clamp = (n, min, max) => Math.max(min, Math.min(max, Number(n) || 0));
+    const ymin = clamp(get('ymin', 400), 0, 1000), xmin = clamp(get('xmin', 400), 0, 1000);
+    const ymax = clamp(get('ymax', 600), 0, 1000), xmax = clamp(get('xmax', 600), 0, 1000);
+    if (ymax <= ymin || xmax <= xmin) return null;
+    return { type: get('type', 'circle').toLowerCase(), ymin, xmin, ymax, xmax, color: get('color', 'red').toLowerCase() };
+}
+
+function drawDisk(img, cx, cy, r, color) {
+    const w = img.bitmap.width, h = img.bitmap.height;
+    for (let dy = -r; dy <= r; dy++) {
+        for (let dx = -r; dx <= r; dx++) {
+            if (dx * dx + dy * dy <= r * r) {
+                const px = Math.round(cx + dx), py = Math.round(cy + dy);
+                if (px >= 0 && px < w && py >= 0 && py < h) img.setPixelColor(color, px, py);
+            }
+        }
+    }
+}
+
+function drawSegment(img, x1, y1, x2, y2, thickness, color) {
+    const steps = Math.max(1, Math.ceil(Math.hypot(x2 - x1, y2 - y1)));
+    const r = Math.max(1, Math.floor(thickness / 2));
+    for (let i = 0; i <= steps; i++) {
+        const t = i / steps;
+        drawDisk(img, x1 + (x2 - x1) * t, y1 + (y2 - y1) * t, r, color);
+    }
+}
+
+async function annotateImageBuffer(buffer, spec) {
+    if (!JimpClass || !buffer || !spec) return null;
+    try {
+        const img = await JimpClass.read(buffer);
+        const w = img.bitmap.width, h = img.bitmap.height;
+        const x1 = Math.round((spec.xmin / 1000) * w), y1 = Math.round((spec.ymin / 1000) * h);
+        const x2 = Math.round((spec.xmax / 1000) * w), y2 = Math.round((spec.ymax / 1000) * h);
+        const thickness = Math.max(4, Math.round(Math.min(w, h) / 130));
+        const colors = { red: 0xFF2222FF, yellow: 0xFFD700FF, green: 0x00E676FF, blue: 0x2979FFFF };
+        const color = colors[spec.color] || colors.red;
+
+        if (spec.type === 'underline') {
+            drawSegment(img, x1, Math.min(h - 4, y2 + 4), x2, Math.min(h - 4, y2 + 4), thickness + 2, color);
+        } else if (spec.type === 'box') {
+            drawSegment(img, x1, y1, x2, y1, thickness, color);
+            drawSegment(img, x2, y1, x2, y2, thickness, color);
+            drawSegment(img, x2, y2, x1, y2, thickness, color);
+            drawSegment(img, x1, y2, x1, y1, thickness, color);
+        } else if (spec.type === 'arrow') {
+            const tx = (x1 + x2) / 2, ty = (y1 + y2) / 2;
+            const sx = tx > w / 2 ? Math.max(10, x1 - w * 0.14) : Math.min(w - 10, x2 + w * 0.14);
+            const sy = ty > h / 2 ? Math.max(10, y1 - h * 0.14) : Math.min(h - 10, y2 + h * 0.14);
+            drawSegment(img, sx, sy, tx, ty, thickness, color);
+            const ang = Math.atan2(ty - sy, tx - sx), head = Math.max(14, thickness * 4);
+            drawSegment(img, tx, ty, tx - head * Math.cos(ang - 0.5), ty - head * Math.sin(ang - 0.5), thickness, color);
+            drawSegment(img, tx, ty, tx - head * Math.cos(ang + 0.5), ty - head * Math.sin(ang + 0.5), thickness, color);
+        } else {
+            const cx = (x1 + x2) / 2, cy = (y1 + y2) / 2, rx = Math.max(12, (x2 - x1) / 2), ry = Math.max(12, (y2 - y1) / 2);
+            const r = Math.max(1, Math.floor(thickness / 2));
+            for (let a = 0; a < 360; a++) {
+                const rad = (a * Math.PI) / 180;
+                drawDisk(img, cx + rx * Math.cos(rad), cy + ry * Math.sin(rad), r, color);
+            }
+        }
+        const outBuf = typeof img.getBufferAsync === 'function' ? await img.getBufferAsync('image/png') : await img.getBuffer('image/png');
+        return { buffer: outBuf, mimeType: 'image/png' };
+    } catch (e) {
+        console.warn('[ANNOTATE]', e.message);
+        return null;
+    }
+}
+
+async function locateTargetOnImage(imageBuffer, mimeType, targetDesc) {
+    if (!JimpClass || !imageBuffer || !targetDesc) return null;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_FALLBACK_MODELS[0]}:generateContent?key=${GEMINI_API_KEY}`;
+    try {
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                contents: [{ role: "user", parts: [
+                    { inline_data: { mime_type: mimeType, data: imageBuffer.toString('base64') } },
+                    { text: `Localise sur cette image : "${targetDesc}". Reponds UNIQUEMENT par : [ANNOTATE: type=circle, ymin=0..1000, xmin=0..1000, ymax=0..1000, xmax=0..1000, color=yellow] ou NOT_FOUND si absent.` }
+                ] }],
+                generationConfig: { maxOutputTokens: 120 }
+            }),
+            signal: AbortSignal.timeout(9000)
+        });
+        if (!res.ok) return null;
+        const data = await res.json();
+        const txt = data.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('') || '';
+        const m = txt.match(/\[ANNOTATE\s*:\s*([^\]]+)\]/i);
+        return m ? parseAnnotateSpec(m[1]) : null;
+    } catch (_) { return null; }
+}
+
 function extractFallbackImageQuery(question = "") {
     const q = String(question || '').trim();
     const wantsImg = /\b(image|images|photo|photos|foto|fotos|phto|picture|pic|illustration|logo|logos|montre[- ]?moi|envoie[- ]?moi.*(image|photo|foto|logo)|affiche[- ]?moi)\b/i.test(q);
@@ -414,7 +516,7 @@ function unwrapMessage(m) {
 }
 
 function formatForWhatsApp(text = "") {
-    return text.replace(/\[IMAGE_SEARCH\s*:[^\]]*\]/gi, '')
+    return text.replace(/\[(IMAGE_SEARCH|ANNOTATE|NEEDS_ANNOTATE)\s*:[^\]]*\]/gi, '')
         .replace(/^.*?(Je vais (maintenant )?(chercher|vérifier|verifier|analyser|scanner)[^\n]*\n+)/gim, '')
         .replace(/^\s*\*\s+/gm, '• ').replace(/^#{1,6}\s*(.+)$/gm, (_, t) => `*${t.replace(/\*/g, '').trim()}*`)
         .replace(/\*\*(.+?)\*\*/g, '*$1*').replace(/^\s*---+\s*$/gm, '').replace(/\n{3,}/g, '\n\n').trim();
@@ -442,7 +544,7 @@ function analyzeUserRequest(question = "", media = null, history = []) {
     if (!q) return { intent: 'MATCH_ANALYSIS', thinkingLevel: 'high' };
     if (['prono', 'pronostic', 'analyse match', 'ticket', 'pari', 'cote', 'btts', '1x2', 'double chance', 'plus de', 'moins de', 'score', 'matchs du jour', 'ce soir', "aujourd'hui", ' vs ', ' contre '].some(k => q.includes(k))) return { intent: 'MATCH_ANALYSIS', thinkingLevel: 'high' };
     if (['mère', 'mere', 'père', 'pere', 'famille', 'frère', 'frere', 'sœur', 'soeur', 'grand-père', 'qui suis-je', "m'aimes", 'triste', 'seul', 'fatigué', 'fatigue', 'inquiet', 'peur', 'heureux', 'dieu', 'bible', 'foi'].some(k => q.includes(k))) return { intent: 'PERSONAL_SENSITIVE', thinkingLevel: 'medium' };
-    if (['pourquoi', 'comment', 'explique', 'analyse', 'compare', 'différence', 'difference', 'science', 'biologie', 'robot', 'intelligence artificielle', 'ia', 'philosophie', 'univers', 'astronomie', 'écologie', 'ecologie', 'histoire', 'chimie', 'future lab', 'jarvis', 'code', 'architecture', 'stratégie', 'strategie', 'image', 'photo', 'foto', 'logo'].some(k => q.includes(k)) || q.length > 85 || history.length >= 4) return { intent: 'DEEP_REASONING', thinkingLevel: 'high' };
+    if (['pourquoi', 'comment', 'explique', 'analyse', 'compare', 'différence', 'difference', 'science', 'biologie', 'robot', 'intelligence artificielle', 'ia', 'philosophie', 'univers', 'astronomie', 'écologie', 'ecologie', 'histoire', 'chimie', 'future lab', 'jarvis', 'code', 'architecture', 'stratégie', 'strategie', 'image', 'photo', 'foto', 'logo', 'entoure', 'souligne'].some(k => q.includes(k)) || q.length > 85 || history.length >= 4) return { intent: 'DEEP_REASONING', thinkingLevel: 'high' };
     return { intent: 'SIMPLE_QUERY', thinkingLevel: 'low' };
 }
 
@@ -473,16 +575,20 @@ Il souhaite apprendre, inventer, entreprendre et contribuer au développement sc
         ? `DEVELOPPEMENT APPROFONDI : Explique clairement (principe -> nuance -> application concrete si pertinent). Distingue science etablie et foi. N'impose aucune specialite universitaire.`
         : `MOTEUR FOOT & TICKETS : Verifie match/date/heure (${date}, apres ${heure} Lubumbashi), forme (5 matchs), classement, absents et H2H via Google Search. N'invente rien. Donne : *Victoire 1X2* • *Double Chance* • *Plus/Moins de buts* • *BTTS* • *Score probable* • *Option à risque réduit*. Distingue *probabilités statistiques* et *estimations* (max *Confiance : 5/10 — Fiabilité : INSUFFISANTE* si donnees 2026 manquantes, jamais 10/10).`;
 
+    const annotRule = JimpClass
+        ? `- ANNOTATION SUR IMAGE : Si une image est jointe et qu'on te demande d'entourer, souligner, encadrer ou pointer un element precis, ajoute a la fin : [ANNOTATE: type=circle|box|underline|arrow, ymin=0..1000, xmin=0..1000, ymax=0..1000, xmax=0..1000, color=red|yellow|green]. Si tu cherches une NOUVELLE image a annoter, ajoute [IMAGE_SEARCH: ...] ET [NEEDS_ANNOTATE: description courte de ce qu'il faut entourer].`
+        : `- ANNOTATION INDISPONIBLE : Le module de dessin (jimp) n'est pas encore installe ; decris simplement l'emplacement visuel avec des reperes (haut/bas/gauche/droite).`;
+
     return `Tu es GIM SNEY, assistant intelligent, analytique et polyvalent cree par ILUNGA MONGA DIEUDONNÉ. Date : ${date}, ${heure} (Lubumbashi). ${greeting}${memBlock}
 ${bioRule}
 ${creatorSearch ? creatorSearch.contextText : ''}
-RAISONNEMENT : 1) Comprends l'intention reelle et le contexte. 2) Raisonne logiquement etape par etape en silence. 3) Distingue *faits vérifiés*, *hypothèses/probabilités* et *croyances*. Reconnais tes incertitudes/erreurs sans inventer. 4) Adapte ton ton et ne repete pas les infos deja donnees.
+RAISONNEMENT : 1) Comprends l'intention reelle et le contexte. 2) Raisonne logiquement etape par etape en silence. 3) Distingue *faits vérifiés*, *hypothèses/probabilités* et *croyances*. Reconnais tes incertitudes/erreurs sans inventer.
 TACT CREATEUR : Ne dis JAMAIS "En tant qu'intelligence artificielle...", "dans ma base de données", "dans mon dossier" ou "c'est un sujet sensible". Si Dieudonné demande si tu l'aimes : reponds avec chaleur, loyauté et gratitude ❤️🚀. Sa mère biologique est *ILUNGA NYOTA FATUMA* (13/12/1977) et sa deuxième mère est *MULIMBI CHRISTINE* (depuis 2012, à Lubumbashi) — aucune question intrusive sur son enfance. Ne pretends jamais sauvegarder sans "!memo categorie | personne | info".
-VISION, MEMOIRE VISUELLE & AUDIO : Tu VOIS parfaitement les photos/captures/tickets (y compris la derniere image envoyee ou recue en memoire) et ECOUTES les vocaux. Ne dis JAMAIS que tu ne peux pas voir les captures d'ecran ni que tu n'as pas de memoire visuelle.
-RECHERCHE ET ENVOI D'IMAGES INTERNET (UNIVERSEL) :
-- Tu es connecte a un moteur d'images universel (tous sujets).
-- Si l'utilisateur demande une image OU si une image illustre utilement ta reponse, ajoute a la fin : [IMAGE_SEARCH: requete claire corrigee].
-- Si une image de la conversation est deja jointe pour analyse, reponds dessus directement SANS lancer [IMAGE_SEARCH: ...] sauf demande d'une nouvelle image.
+VISION, MEMOIRE VISUELLE, RECHERCHE & ANNOTATION D'IMAGES :
+- Tu VOIS les photos/captures/tickets (y compris la derniere image envoyee ou recue en memoire) et ECOUTES les vocaux. Ne dis JAMAIS que tu ne vois pas les captures.
+- RECHERCHE D'IMAGES : Pour toute demande d'image ou illustration utile (tous sujets), ajoute a la fin : [IMAGE_SEARCH: requete claire].
+${annotRule}
+- HONNETETE VISUELLE STRICTEMENT OBLIGATOIRE : Ne dis JAMAIS "que j'ai souligné/entouré pour vous" si tu n'as pas emis de balise [ANNOTATE: ...] ou [NEEDS_ANNOTATE: ...].
 STYLE WHATSAPP : Emojis colorés (🟢 🟡 🔴 🔵 ❤️ 💙 ✨ 🫡 🤖 🔬 🚀 ⚽ 🎯 🏆 📊 🎟️), *gras* avec un seul astérisque, • pour les listes (jamais ### ni ** ni ---).
 ${domainRules}`;
 }
@@ -528,16 +634,35 @@ async function askGemini(groupJid, userIdentity, question, media = null, modelIn
         if (!raw) throw new Error("Reponse vide.");
 
         const imgMatch = raw.match(/\[IMAGE_SEARCH\s*:\s*([^\]]+)\]/i);
+        const annotMatch = raw.match(/\[ANNOTATE\s*:\s*([^\]]+)\]/i);
+        const needsAnnotMatch = raw.match(/\[NEEDS_ANNOTATE\s*:\s*([^\]]+)\]/i);
         const imageQuery = imgMatch ? imgMatch[1].trim() : (!media ? extractFallbackImageQuery(promptText) : null);
 
         const answer = formatForWhatsApp(raw);
         let imageResult = null;
+
         if (imageQuery) {
             imageResult = await fetchBestWebImage(imageQuery);
+            if (imageResult && needsAnnotMatch && JimpClass) {
+                const spec = await locateTargetOnImage(imageResult.buffer, imageResult.mimeType, needsAnnotMatch[1].trim());
+                if (spec) {
+                    const drawn = await annotateImageBuffer(imageResult.buffer, spec);
+                    if (drawn) imageResult = drawn;
+                }
+            }
             if (imageResult) rememberUserImage(userIdentity.userId, imageResult.mimeType, imageResult.buffer, imageQuery);
+        } else if (media?.kind === 'image' && annotMatch && JimpClass) {
+            const spec = parseAnnotateSpec(annotMatch[1]);
+            if (spec) {
+                const drawn = await annotateImageBuffer(Buffer.from(media.data, 'base64'), spec);
+                if (drawn) {
+                    imageResult = drawn;
+                    rememberUserImage(userIdentity.userId, drawn.mimeType, drawn.buffer, media.label || 'image annotee');
+                }
+            }
         }
 
-        const savedReply = imageResult ? `${answer}\n[Image envoyée : ${imageQuery}]` : answer;
+        const savedReply = imageResult ? `${answer}\n[Image envoyée : ${imageQuery || 'image annotée'}]` : answer;
         memoryDB.appendExchange(userIdentity, media?.kind === 'image' ? `[Image] ${promptText}` : media?.kind === 'audio' ? `[Vocal]` : promptText, savedReply, analysis.intent);
         return { text: answer, image: imageResult };
     } catch (err) {
