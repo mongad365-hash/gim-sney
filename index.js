@@ -8,6 +8,7 @@ let DatabaseSync = null;
 try { ({ DatabaseSync } = require('node:sqlite')); } catch (_) { DatabaseSync = null; }
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "AQ.Ab8RN6KeFgt7wruY4XiA-_lb7u5SjVftPUIq6kQTbA3VPv891A";
+const SERPER_API_KEY = process.env.SERPER_API_KEY || ""; // Optionnel : Google Images sur serper.dev
 const GEMINI_FALLBACK_MODELS = [...new Set([process.env.GEMINI_MODEL || "gemini-2.5-flash", "gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.1-flash-lite"])];
 const CREATOR_PHONE = "243977332867";
 const SELF_URL = "https://gim-sney.onrender.com";
@@ -123,7 +124,7 @@ class CreatorMemoryEngine {
         const prCols = ['id', 'name', 'founder', 'motto', 'location', 'vision', 'departments', 'status', 'confirmation_level', 'source', 'updated_at'];
         [
             { id: 'proj_future_lab', name: 'ILUNGA FUTURE LAB', founder: 'ILUNGA MONGA DIEUDONNÉ', motto: 'THE FUTURE BEGINS WITH SCIENCE', location: 'RDC — montagne forêt congolaise', vision: 'Immense laboratoire futuriste inspiré de Kaal (Krrish 3).', departments: 'IA, Chimie, Informatique, Biologie, Médecine/Biotech, Astronomie/Espace, Énergie/Tech avancées', status: 'Rêve long terme', confirmation_level: 'confirmee', source: src },
-            { id: 'proj_gim_sney', name: 'GIM SNEY', founder: 'ILUNGA MONGA DIEUDONNÉ', location: 'WhatsApp', vision: 'Assistant intelligent (sport, sciences, recherche, PDF/photos, assistance personnelle, mémoire persistante).', departments: 'Sport, IA, Vision, Mémoire', status: 'Actif', confirmation_level: 'confirmee', source: src },
+            { id: 'proj_gim_sney', name: 'GIM SNEY', founder: 'ILUNGA MONGA DIEUDONNÉ', location: 'WhatsApp', vision: 'Assistant intelligent (sport, sciences, recherche, PDF/photos, recherche d’images, mémoire persistante).', departments: 'Sport, IA, Vision, Mémoire', status: 'Actif', confirmation_level: 'confirmee', source: src },
             { id: 'proj_jarvis', name: 'J.A.R.V.I.S. AI Business Hub RDC', founder: 'ILUNGA MONGA DIEUDONNÉ', location: 'RDC', vision: 'Assistant personnel intelligent et plateforme technologique.', departments: 'IA, Automatisation', status: 'En développement', confirmation_level: 'confirmee', source: src }
         ].forEach(pr => this.upsert('projects', pr, prCols));
 
@@ -271,6 +272,109 @@ let creatorDB = null;
 try { creatorDB = new CreatorMemoryEngine(); } catch (err) { console.error('[CREATOR_DB ERREUR]:', err.message); }
 
 // ==========================================
+// MOTEUR UNIVERSEL DE RECHERCHE D'IMAGES
+// ==========================================
+function isValidImageBuffer(buf) {
+    if (!buf || buf.length < 1500 || buf.length > 15 * 1024 * 1024) return null;
+    if (buf[0] === 0xFF && buf[1] === 0xD8 && buf[2] === 0xFF) return 'image/jpeg';
+    if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47) return 'image/png';
+    if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return 'image/gif';
+    if (buf.length > 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
+    return null;
+}
+
+async function downloadValidImage(url) {
+    if (!url || !/^https?:\/\//i.test(url)) return null;
+    try {
+        const res = await fetch(url, { headers: { 'User-Agent': 'GIMSneyBot/2.0 (WhatsApp)' }, redirect: 'follow', signal: AbortSignal.timeout(8000) });
+        if (!res.ok) return null;
+        const buf = Buffer.from(await res.arrayBuffer());
+        const mimeType = isValidImageBuffer(buf);
+        return mimeType ? { buffer: buf, mimeType } : null;
+    } catch (_) { return null; }
+}
+
+async function tryImageUrls(urls, seen) {
+    for (const url of urls) {
+        if (!url || seen.has(url)) continue;
+        seen.add(url);
+        const img = await downloadValidImage(url);
+        if (img) return img;
+    }
+    return null;
+}
+
+async function fetchBestWebImage(query) {
+    if (!query || !query.trim()) return null;
+    const seen = new Set();
+
+    // 1. Serper Google Images (si SERPER_API_KEY configuree)
+    if (SERPER_API_KEY) {
+        try {
+            const res = await fetch('https://google.serper.dev/images', {
+                method: 'POST',
+                headers: { 'X-API-KEY': SERPER_API_KEY, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ q: query, num: 6 }),
+                signal: AbortSignal.timeout(7000)
+            });
+            if (res.ok) {
+                const data = await res.json();
+                const urls = [];
+                for (const it of (data.images || [])) { if (it.imageUrl) urls.push(it.imageUrl); if (it.thumbnailUrl) urls.push(it.thumbnailUrl); }
+                const found = await tryImageUrls(urls, seen);
+                if (found) { console.log(`[IMAGE SERPER] "${query}"`); return found; }
+            }
+        } catch (_) {}
+    }
+
+    // 2. Wikipedia FR & EN (sans cle API, multi-domaines)
+    for (const lang of ['fr', 'en']) {
+        try {
+            const u = `https://${lang}.wikipedia.org/w/api.php?action=query&generator=search&gsrsearch=${encodeURIComponent(query)}&gsrlimit=5&prop=pageimages&piprop=thumbnail|original&pithumbsize=1000&format=json&origin=*`;
+            const res = await fetch(u, { headers: { 'User-Agent': 'GIMSneyBot/2.0' }, signal: AbortSignal.timeout(7000) });
+            if (res.ok) {
+                const data = await res.json();
+                const pages = Object.values(data.query?.pages || {}).sort((a, b) => (a.index || 0) - (b.index || 0));
+                const urls = [];
+                for (const p of pages) { if (p.thumbnail?.source) urls.push(p.thumbnail.source); if (p.original?.source) urls.push(p.original.source); }
+                const found = await tryImageUrls(urls, seen);
+                if (found) { console.log(`[IMAGE WIKI-${lang.toUpperCase()}] "${query}"`); return found; }
+            }
+        } catch (_) {}
+    }
+
+    // 3. Wikimedia Commons (photos, logos, illustrations)
+    try {
+        const u = `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrnamespace=6&gsrsearch=${encodeURIComponent(query)}&gsrlimit=6&prop=imageinfo&iiprop=url|mime&iiurlwidth=1000&format=json&origin=*`;
+        const res = await fetch(u, { headers: { 'User-Agent': 'GIMSneyBot/2.0' }, signal: AbortSignal.timeout(7000) });
+        if (res.ok) {
+            const data = await res.json();
+            const pages = Object.values(data.query?.pages || {}).sort((a, b) => (a.index || 0) - (b.index || 0));
+            const urls = [];
+            for (const p of pages) {
+                const info = p.imageinfo?.[0];
+                if (info?.thumburl) urls.push(info.thumburl);
+                else if (info?.url && /image\/(jpeg|png|webp|gif)/i.test(info.mime || '')) urls.push(info.url);
+            }
+            const found = await tryImageUrls(urls, seen);
+            if (found) { console.log(`[IMAGE COMMONS] "${query}"`); return found; }
+        }
+    } catch (_) {}
+
+    return null;
+}
+
+function extractFallbackImageQuery(question = "") {
+    const q = String(question || '').trim();
+    const wantsImg = /\b(image|images|photo|photos|foto|fotos|phto|picture|pic|illustration|logo|logos|montre[- ]?moi|envoie[- ]?moi.*(image|photo|foto|logo)|affiche[- ]?moi)\b/i.test(q);
+    if (!wantsImg) return null;
+    const cleaned = q
+        .replace(/^(peux[- ]tu |tu peux |stp |s'il te pla[iî]t )?(me |m')?(envoyer|envoie|montrer|montre|trouver|trouve|chercher|cherche|donner|donne|afficher|affiche)[- ]?(moi )?(une |un |des |la |le |l'|les )?(belle |jolie |vraie )?(image|images|photo|photos|foto|fotos|phto|picture|pic|illustration)(s)?( de | d'| du | des | sur | concernant )?/i, '')
+        .replace(/[?!.]+$/g, '').trim();
+    return cleaned.length >= 2 ? cleaned : null;
+}
+
+// ==========================================
 // UTILITAIRES WHATSAPP, RAISONNEMENT & GEMINI
 // ==========================================
 function extractPhoneFromJid(jid = "") { return (!jid || jid.endsWith('@g.us') || jid.endsWith('@lid')) ? "" : (jid.split('@')[0] || "").split(':')[0].replace(/\D/g, ''); }
@@ -299,7 +403,8 @@ function unwrapMessage(m) {
 }
 
 function formatForWhatsApp(text = "") {
-    return text.replace(/^.*?(Je vais (maintenant )?(chercher|vérifier|verifier|analyser|scanner)[^\n]*\n+)/gim, '')
+    return text.replace(/\[IMAGE_SEARCH\s*:[^\]]*\]/gi, '')
+        .replace(/^.*?(Je vais (maintenant )?(chercher|vérifier|verifier|analyser|scanner)[^\n]*\n+)/gim, '')
         .replace(/^\s*\*\s+/gm, '• ').replace(/^#{1,6}\s*(.+)$/gm, (_, t) => `*${t.replace(/\*/g, '').trim()}*`)
         .replace(/\*\*(.+?)\*\*/g, '*$1*').replace(/^\s*---+\s*$/gm, '').replace(/\n{3,}/g, '\n\n').trim();
 }
@@ -326,11 +431,9 @@ function analyzeUserRequest(question = "", media = null, history = []) {
     if (!q) return { intent: 'MATCH_ANALYSIS', thinkingLevel: 'high' };
     if (['prono', 'pronostic', 'analyse match', 'ticket', 'pari', 'cote', 'btts', '1x2', 'double chance', 'plus de', 'moins de', 'score', 'matchs du jour', 'ce soir', "aujourd'hui", ' vs ', ' contre '].some(k => q.includes(k))) return { intent: 'MATCH_ANALYSIS', thinkingLevel: 'high' };
     if (['mère', 'mere', 'père', 'pere', 'famille', 'frère', 'frere', 'sœur', 'soeur', 'grand-père', 'qui suis-je', "m'aimes", 'triste', 'seul', 'fatigué', 'fatigue', 'inquiet', 'peur', 'heureux', 'dieu', 'bible', 'foi'].some(k => q.includes(k))) return { intent: 'PERSONAL_SENSITIVE', thinkingLevel: 'medium' };
-    if (['pourquoi', 'comment', 'explique', 'analyse', 'compare', 'différence', 'difference', 'science', 'biologie', 'robot', 'intelligence artificielle', 'ia', 'philosophie', 'univers', 'astronomie', 'écologie', 'ecologie', 'histoire', 'chimie', 'future lab', 'jarvis', 'code', 'architecture', 'stratégie', 'strategie'].some(k => q.includes(k)) || q.length > 85 || history.length >= 4) return { intent: 'DEEP_REASONING', thinkingLevel: 'high' };
+    if (['pourquoi', 'comment', 'explique', 'analyse', 'compare', 'différence', 'difference', 'science', 'biologie', 'robot', 'intelligence artificielle', 'ia', 'philosophie', 'univers', 'astronomie', 'écologie', 'ecologie', 'histoire', 'chimie', 'future lab', 'jarvis', 'code', 'architecture', 'stratégie', 'strategie', 'image', 'photo', 'foto', 'logo'].some(k => q.includes(k)) || q.length > 85 || history.length >= 4) return { intent: 'DEEP_REASONING', thinkingLevel: 'high' };
     return { intent: 'SIMPLE_QUERY', thinkingLevel: 'low' };
 }
-
-function classifySportsIntent(question = "", media = null) { return analyzeUserRequest(question, media).intent; }
 
 function getSystemPrompt(userIdentity, memoryContext, creatorSearch, analysis) {
     const now = new Date();
@@ -362,9 +465,13 @@ Il souhaite apprendre, inventer, entreprendre et contribuer au développement sc
     return `Tu es GIM SNEY, assistant intelligent, analytique et polyvalent cree par ILUNGA MONGA DIEUDONNÉ. Date : ${date}, ${heure} (Lubumbashi). ${greeting}${memBlock}
 ${bioRule}
 ${creatorSearch ? creatorSearch.contextText : ''}
-RAISONNEMENT : 1) Comprends l'intention reelle et le contexte. 2) Raisonne logiquement etape par etape en silence. 3) Distingue *faits vérifiés*, *hypothèses/probabilités* et *croyances*. Reconnais tes incertitudes/erreurs sans inventer. 4) Adapte ton ton a l'emotion et ne repete pas les infos deja donnees.
-TACT CREATEUR : Ne dis JAMAIS "En tant qu'intelligence artificielle...", "dans ma base de données", "dans mon dossier" ou "c'est un sujet sensible". Si Dieudonné demande si tu l'aimes : reponds avec chaleur, loyauté et gratitude (ex: "Oui mon Créateur 🫡✨ Même sans cœur biologique, je vous porte une profonde gratitude et une loyauté totale ❤️🚀."). Sa mère biologique est *ILUNGA NYOTA FATUMA* (13/12/1977) et sa deuxième mère est *MULIMBI CHRISTINE* (depuis 2012, à Lubumbashi) — aucune question intrusive sur son enfance. Ne pretends jamais sauvegarder sans "!memo categorie | personne | info".
+RAISONNEMENT : 1) Comprends l'intention reelle et le contexte. 2) Raisonne logiquement etape par etape en silence. 3) Distingue *faits vérifiés*, *hypothèses/probabilités* et *croyances*. Reconnais tes incertitudes/erreurs sans inventer. 4) Adapte ton ton et ne repete pas les infos deja donnees.
+TACT CREATEUR : Ne dis JAMAIS "En tant qu'intelligence artificielle...", "dans ma base de données", "dans mon dossier" ou "c'est un sujet sensible". Si Dieudonné demande si tu l'aimes : reponds avec chaleur, loyauté et gratitude ❤️🚀. Sa mère biologique est *ILUNGA NYOTA FATUMA* (13/12/1977) et sa deuxième mère est *MULIMBI CHRISTINE* (depuis 2012, à Lubumbashi) — aucune question intrusive sur son enfance. Ne pretends jamais sauvegarder sans "!memo categorie | personne | info".
 VISION/AUDIO : Tu VOIS photos/captures/tickets et ECOUTES les vocaux.
+RECHERCHE ET ENVOI D'IMAGES INTERNET (UNIVERSEL) :
+- Tu es connecte a un moteur d'images universel (tous sujets sans exception : personnes, animaux, nature, sciences, astronomie, histoire, geographie, monuments, objets, vehicules, sports, logos, illustrations...).
+- Quand l'utilisateur demande une image (meme avec des fautes d'orthographe) OU quand une image reelle illustre utilement ta reponse (ex: planete, animal, monument, personnalite, concept visuel), ajoute tout a la fin : [IMAGE_SEARCH: requete claire et orthographice corrigee].
+- N'invente jamais d'URL d'image dans ton texte et ne dis jamais que tu ne peux pas envoyer d'images.
 STYLE WHATSAPP : Emojis colorés (🟢 🟡 🔴 🔵 ❤️ 💙 ✨ 🫡 🤖 🔬 🚀 ⚽ 🎯 🏆 📊 🎟️), *gras* avec un seul astérisque, • pour les listes (jamais ### ni ** ni ---).
 ${domainRules}`;
 }
@@ -408,9 +515,17 @@ async function askGemini(groupJid, userIdentity, question, media = null, modelIn
         const raw = data.candidates?.[0]?.content?.parts?.filter(p => !p.thought && typeof p.text === 'string')?.map(p => p.text)?.join("")?.trim();
         if (!raw) throw new Error("Reponse vide.");
 
+        const imgMatch = raw.match(/\[IMAGE_SEARCH\s*:\s*([^\]]+)\]/i);
+        const imageQuery = imgMatch ? imgMatch[1].trim() : (!media ? extractFallbackImageQuery(promptText) : null);
+
         const answer = formatForWhatsApp(raw);
+        let imageResult = null;
+        if (imageQuery) {
+            imageResult = await fetchBestWebImage(imageQuery);
+        }
+
         memoryDB.appendExchange(userIdentity, media?.kind === 'image' ? `[Image] ${promptText}` : media?.kind === 'audio' ? `[Vocal]` : promptText, answer, analysis.intent);
-        return answer;
+        return { text: answer, image: imageResult };
     } catch (err) {
         const m = err.message || "";
         if (allowThinking && err.status === 400 && (m.includes('thinking') || m.includes('Thinking'))) return askGemini(groupJid, userIdentity, question, media, modelIndex, retries, false);
@@ -495,8 +610,17 @@ async function startBot() {
                 const question = text.replace(/^(!gim|!prono|\/predict|pronostic|gimsney)\s*/i, '').trim() || (media ? "" : "Cherche les vrais matchs d'aujourd'hui et propose une analyse complete avec pronostics.");
                 try {
                     await sock.sendPresenceUpdate('composing', sender);
-                    const reply = await askGemini(sender, userIdentity, question, media);
-                    await sendTracked(sock, sender, { text: reply }, { quoted: msg });
+                    const result = await askGemini(sender, userIdentity, question, media);
+                    if (result.image?.buffer) {
+                        if (result.text.length <= 950) {
+                            await sendTracked(sock, sender, { image: result.image.buffer, mimetype: result.image.mimeType, caption: result.text }, { quoted: msg });
+                        } else {
+                            await sendTracked(sock, sender, { image: result.image.buffer, mimetype: result.image.mimeType }, { quoted: msg });
+                            await sendTracked(sock, sender, { text: result.text }, { quoted: msg });
+                        }
+                    } else {
+                        await sendTracked(sock, sender, { text: result.text }, { quoted: msg });
+                    }
                 } catch (err) {
                     console.error("Erreur:", err.message);
                     await sendTracked(sock, sender, { text: "⚠️ Petite saturation temporaire sur mes donnees en direct, reposez votre question dans quelques instants !" }, { quoted: msg });
